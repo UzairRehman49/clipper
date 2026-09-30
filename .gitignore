@@ -1,0 +1,18 @@
+# media and generated data - large, and sources are other people's shows
+sources/
+work/
+out/
+logs/
+
+# environments, caches, local backups
+.venv/
+.venv-diar/
+__pycache__/
+.backup/
+models/
+.DS_Store
+.claude/
+
+# credentials (publish_youtube.py)
+token.json
+client_secret.json
