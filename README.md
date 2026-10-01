@@ -222,6 +222,10 @@ system that compounds.
   speaker the source never shows still gets a reaction shot, because the
   source's own edit decides what's on screen. Without `.venv-diar` or the
   models, it falls back to 5 fps mouth movement. Cost: ~10-40 s per clip.
+- **Moving camera (IRL, handheld)**: the crop pans with the talker only when
+  a locked crop would lose them; studio shots stay locked.
+- **Burned-in tickers and overlays** (sports lower thirds, superchats,
+  stream chat) can be cut by the crop; there's no text detection.
 - **Shots with no detectable face** (screen recordings, B-roll, a back of a
   head) show the whole frame over a blurred copy rather than a crop.
 - **Hindi-heavy speech transcribes as garbled English** (Whisper forces
