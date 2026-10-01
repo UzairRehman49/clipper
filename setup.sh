@@ -53,9 +53,6 @@ echo "==> youtube publishing (optional)"
 pip install google-api-python-client google-auth-oauthlib
 
 mkdir -p sources work out logs
-cat > logs/clips.csv <<'CSV'
-date,source,clip_id,platform,campaign,hook_type,posted_url,views_24h,views_7d,approved,reject_reason
-CSV
 
 cat <<'EOF'
 

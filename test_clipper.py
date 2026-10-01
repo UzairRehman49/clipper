@@ -299,3 +299,22 @@ segs, _ = plan_layout(offcam, 5, [], [(0, 2.3, "HOST"), (2.5, 7.6, "WOMAN")], 7.
 centres = [(g[3][0][0] + g[3][0][2] / 2) / 1920 for g in segs if g[2] == "R"]
 assert segs and all(g[2] == "R" for g in segs) and all(abs(c - 0.43) < 0.05 for c in centres), segs
 print("ok off-camera")
+
+# clip log: a re-render refreshes pipeline columns but keeps the views typed in by hand
+import csv as _csv, tempfile as _tf
+from pathlib import Path
+from clipper import log_clip, clip_stats
+lp = Path(_tf.mkdtemp()) / "clips.csv"
+log_clip({"source": "v", "clip_id": 1, "platform": "tiktok", "hook": "old", "final": 7}, lp)
+rows = list(_csv.DictReader(lp.open()))
+rows[0]["views_7d"] = "1,200"
+with lp.open("w", newline="") as f:
+    w = _csv.DictWriter(f, rows[0].keys()); w.writeheader(); w.writerows(rows)
+log_clip({"source": "v", "clip_id": 1, "platform": "tiktok", "hook": "new", "final": 8}, lp)
+log_clip({"source": "v", "clip_id": 2, "platform": "tiktok", "hook": "x", "final": 6}, lp)
+rows = list(_csv.DictReader(lp.open()))
+assert len(rows) == 2 and rows[0]["hook"] == "new" and rows[0]["views_7d"] == "1,200", rows
+st = clip_stats([{"platform": "a", "final": str(i), "views_24h": str(i * 10)} for i in range(6)]
+                + [{"platform": "b", "final": "9"}])                     # no views: ignored
+assert st["n"] == 6 and st["groups"]["platform"]["a"] == (6, 25.0) and st["corr"]["final"] > 0.99, st
+print("ok clip log")

@@ -14,6 +14,7 @@ Everything runs on your Mac. No cloud, no subscription, no watermark.
   python3 clipper.py select     sources/ep42.mp4     # AI editor judges + plans the cuts
   python3 clipper.py review     sources/ep42.mp4     # (or tick them by hand instead)
   python3 clipper.py render     sources/ep42.mp4 --platform tiktok,instagram
+  python3 clipper.py stats                           # which choices earned views (logs/clips.csv)
 """
 
 import argparse
@@ -2556,10 +2557,94 @@ def cmd_render(args):
                     f"framing: {framing}\n"
                     f"source: {src.name} @ {start:.1f}-{c['end']:.1f}\n")
                 log(f"    -> {dest}")
+                log_clip({"date": time.strftime("%Y-%m-%d"), "source": src.stem, "clip_id": c["id"],
+                          "platform": plat or "default", "file": dest.name, "duration": f"{total:.1f}",
+                          "origin": c.get("source", ""), "signals": "+".join(c.get("signals") or []),
+                          "score": c.get("score", ""), "final": (c.get("plan") or {}).get("final", ""),
+                          "loop": int(bool(seam)), "layout": max(modes, key=modes.get),
+                          "talker": f"{qa['talker']:.2f}", "hook_variant": hooks.index(hook_text),
+                          "hook": hook_text, "caption": c.get("caption", "")})
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
     log(f"\n  done: {outdir}")
+
+
+# ------------------------------------------------------------ learning -----
+
+CLIP_LOG = ROOT / "logs" / "clips.csv"
+AUTO_COLS = ["date", "source", "clip_id", "platform", "file", "duration", "origin", "signals",
+             "score", "final", "loop", "layout", "talker", "hook_variant", "hook", "caption"]
+MANUAL_COLS = ["posted_url", "views_24h", "views_7d", "likes", "approved", "reject_reason"]
+
+
+def log_clip(row, path=None):
+    """Upsert one rendered clip into the log, keyed by source/clip/platform.
+    A re-render refreshes what the pipeline knows and never touches the
+    columns you fill in by hand (url, views, ...)."""
+    import csv
+    path = path or CLIP_LOG
+    path.parent.mkdir(exist_ok=True)
+    rows = list(csv.DictReader(path.open())) if path.exists() else []
+    key = lambda r: (r.get("source"), str(r.get("clip_id")), r.get("platform"))  # noqa: E731
+    row = {k: str(v) for k, v in row.items()}
+    for r in rows:
+        if key(r) == key(row):
+            r.update(row)
+            break
+    else:
+        rows.append(row)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", newline="") as f:
+        w = csv.DictWriter(f, AUTO_COLS + MANUAL_COLS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    tmp.replace(path)                       # never leave a half-written log
+
+
+def views_of(r):
+    for k in ("views_7d", "views_24h"):
+        try:
+            return float(r.get(k, "").replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
+
+def clip_stats(rows):
+    """Median views per value of each pipeline choice, plus whether the
+    judge's score ranks clips the way the audience did."""
+    rows = [(r, v) for r in rows if (v := views_of(r)) is not None]
+    out = {"n": len(rows), "groups": {}, "corr": {}}
+    for col in ("platform", "origin", "loop", "layout", "hook_variant", "signals"):
+        g = {}
+        for r, v in rows:
+            g.setdefault(r.get(col) or "-", []).append(v)
+        out["groups"][col] = {k: (len(vs), statistics.median(vs)) for k, vs in g.items()}
+    for col in ("final", "score", "talker", "duration"):
+        pairs = [(float(r[col]), v) for r, v in rows if r.get(col) not in (None, "")]
+        if len(pairs) >= 5 and len({p[0] for p in pairs}) > 1 and len({p[1] for p in pairs}) > 1:
+            out["corr"][col] = statistics.correlation(*zip(*pairs), method="ranked")
+    return out
+
+
+def cmd_stats(args):
+    import csv
+    if not CLIP_LOG.exists():
+        sys.exit(f"no {CLIP_LOG} yet - render something first")
+    s = clip_stats(list(csv.DictReader(CLIP_LOG.open())))
+    if not s["n"]:
+        sys.exit(f"no views logged yet - fill views_24h / views_7d in {CLIP_LOG}")
+    print(f"{s['n']} clips with views (views_7d, else views_24h)\n")
+    for col, g in s["groups"].items():
+        print(f"{col}:")
+        for k, (n, med) in sorted(g.items(), key=lambda x: -x[1][1]):
+            print(f"  {k:24s} n={n:<4d} median views {med:,.0f}")
+    print("\nrank correlation with views (+1 = predicts perfectly, 0 = noise):")
+    for col, r in s["corr"].items():
+        print(f"  {col:10s} {r:+.2f}")
+    if s["n"] < 30:
+        print(f"\n  only {s['n']} clips - treat every number above as a hint, not a finding")
 
 
 # ------------------------------------------------------------------ go -----
@@ -2745,6 +2830,7 @@ def main():
         sp.add_argument("--no-loop", action="store_true", help="no cold-open loop")
         sp.add_argument("--no-zoom", action="store_true", help="no jump-cut / emphasis zooms")
         sp.add_argument("--no-sfx", action="store_true", help="no whoosh / pop")
+    sub.add_parser("stats", help="which pipeline choices earned views (reads logs/clips.csv)")
     a = p.parse_args()
     # Long runs otherwise stall for 15+ min at a time when the Mac idles
     # into sleep (seen on battery). -w: released the moment we exit.
@@ -2757,7 +2843,7 @@ def main():
         os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
     {"ingest": cmd_ingest, "go": cmd_go, "all": cmd_go, "transcribe": cmd_transcribe,
      "find": cmd_find, "select": cmd_select, "review": cmd_review,
-     "render": cmd_render}[a.cmd](a)
+     "render": cmd_render, "stats": cmd_stats}[a.cmd](a)
 
 
 if __name__ == "__main__":

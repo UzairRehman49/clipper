@@ -192,14 +192,22 @@ tiktok,instagram,shorts`.
 
 ## The log is the real asset
 
-`logs/clips.csv` is seeded by setup. Fill it in. After ~100 clips your own
-record of which hook types earned views on *your* accounts in *your* niche
-with *your* audience geography beats any general-purpose model, because it
-is the only data that reflects your actual conditions.
+Every render writes one row per clip and platform to `logs/clips.csv`. Each
+row records the choices the pipeline made: origin (llm / exchange / heat),
+signals, judge score and final score, loop, main layout, talker coverage,
+which hook variant was used, the hook and the caption. Re-rendering updates the
+row in place and never touches the columns you fill in.
 
-Tag each clip with the criterion that made you pick it, then check which
-tags correlate with views after a month. That loop is the only part of this
-business that compounds.
+After posting, fill in `posted_url`, `views_24h`, `views_7d` (and optionally
+`likes`). Then run:
+
+    python3 clipper.py stats
+
+It prints median views for each pipeline choice, and the rank correlation
+between each score and real views. The three per-platform hooks are a free
+A/B test. After ~100 clips, this is the data for retuning the judge and the
+signal weights, or for training Laya as a scorer. It is the only part of this
+system that compounds.
 
 ---
 
