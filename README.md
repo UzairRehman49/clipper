@@ -17,7 +17,7 @@ No subscription, no watermark, no upload limits, no 60-minutes-a-month cap.
 | Hooks: verbatim quotes picked from the clip, one per platform; topic-only captions | AI | local LLM picks, code copies the words |
 | Chapters, YouTube replay heatmap, SponsorBlock ad segments | auto | yt-dlp metadata + SponsorBlock API |
 | Laughter / applause / music per second, tagged into the transcript the LLM reads | AI | PANNs (`events.py`, own venv) |
-| Per-shot vertical layout: locked crop on the speaker, facecam-over-game stack, two-person stack, split-screen box zoom, or fit-over-blur for screens | AI | ffmpeg scene cuts + YuNet faces, FaceMesh mouths, speaker-to-face linking |
+| Per-shot vertical layout: locked crop on the speaker, facecam-over-game stack, two-person stack, split-screen box zoom, or fit-over-blur for screens | AI | ffmpeg scene cuts + YuNet faces, SFace identity across shots, Light-ASD active speaker, voice-to-person linking |
 | Silence + filler-word jump cuts | auto | Whisper word timestamps |
 | Cold-open loop (payoff first, ends right before it) | auto | ffmpeg |
 | Zoom on jump cuts and vocal emphasis, whoosh/pop SFX | auto | ffmpeg `zoompan`, generated SFX |
@@ -216,9 +216,12 @@ system that compounds.
 - **Clip ranking is limited by the 14B model's taste.** Measured: agreement
   with a careful manual ranking +0.46; a comparative-ranking judge did worse
   and was removed. A stronger judge model is the open decision.
-- **Who is talking comes from mouth movement sampled 5x/s**, linked to the
-  diarized voices. Very short turns and heavy crosstalk can still frame a
-  neighbour; an audio-visual active-speaker model (Light-ASD) is the upgrade.
+- **Who is talking comes from Light-ASD** (lip crops at 25 fps read together
+  with the audio), with faces grouped into people across camera angles
+  (SFace), so each voice is matched to a person over the whole clip. A
+  speaker the source never shows still gets a reaction shot, because the
+  source's own edit decides what's on screen. Without `.venv-diar` or the
+  models, it falls back to 5 fps mouth movement. Cost: ~10-40 s per clip.
 - **Shots with no detectable face** (screen recordings, B-roll, a back of a
   head) show the whole frame over a blurred copy rather than a crop.
 - **Hindi-heavy speech transcribes as garbled English** (Whisper forces

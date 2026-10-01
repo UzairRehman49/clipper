@@ -83,6 +83,8 @@ SEMANTIC_DEDUP_THRESHOLD = float(os.environ.get("CLIPPER_SEMANTIC_DEDUP_THRESHOL
 W, H = 1080, 1920
 OUT_W, OUT_H = W, H     # (plan_layout's W/H are the SOURCE size)
 MAX_ZOOM = 1.9          # upscale limit for crops; 2.8 for one split-screen box
+SAME_FACE = 0.363       # SFace cosine: OpenCV's published same-person threshold
+ASD_MARGIN = 1.0        # Light-ASD logits: talker must lead the next face by this much
 CLIP_MIN, CLIP_MAX = 22, 58          # seconds
 CAND_COUNT = 30                      # how many candidates to surface per source
 FIND_VERSION = "2"                   # bump when find's inputs/signals change -> recompute
@@ -1367,6 +1369,7 @@ def scene_cuts(src, start, dur, thresh=0.3):
 
 
 YUNET = ROOT / "models" / "face_detection_yunet_2023mar.onnx"
+SFACE = ROOT / "models" / "face_recognition_sface_2021dec.onnx"
 
 
 def sample_faces(src, start, dur, fps=5):
@@ -1378,7 +1381,10 @@ def sample_faces(src, start, dur, fps=5):
     more resolution can't help it). Mouths: FaceMesh on the face crop from
     the full-resolution frame - 95% of faces readable vs 65% from the old
     480 px frames. MediaPipe detection remains the fallback
-    (CLIPPER_FACES=mediapipe, or the YuNet model file missing)."""
+    (CLIPPER_FACES=mediapipe, or the YuNet model file missing).
+    emb = SFace identity embedding (unit vector) when that model is present:
+    lets plan_layout know the woman in a split screen is the same person
+    as a tiny face in the next wide shot."""
     try:
         import cv2
         import mediapipe as mp
@@ -1395,6 +1401,7 @@ def sample_faces(src, start, dur, fps=5):
             static_image_mode=True, max_num_faces=1, min_detection_confidence=0.2)
         if use_yunet:
             net = cv2.FaceDetectorYN.create(str(YUNET), "", (320, 320), 0.6, 0.3, 5000)
+            rec = cv2.FaceRecognizerSF.create(str(SFACE), "") if SFACE.exists() else None
         else:
             det = mp.solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.4)
         frames = []
@@ -1405,20 +1412,27 @@ def sample_faces(src, start, dur, fps=5):
                 continue
             H_, W_ = big.shape[:2]
             small = cv2.resize(big, (960, round(H_ * 960 / W_))) if W_ > 960 else big
-            boxes = []
+            boxes, embs = [], []
             if use_yunet:
                 net.setInputSize((small.shape[1], small.shape[0]))
                 _, found = net.detect(small)
                 for x in (found if found is not None else []):
                     boxes.append((x[0] / small.shape[1], x[1] / small.shape[0],
                                   x[2] / small.shape[1], x[3] / small.shape[0]))
+                    emb = None
+                    if rec is not None:
+                        row = x.copy()
+                        row[:14] *= W_ / small.shape[1]          # box + landmarks -> full-res coords
+                        e = rec.feature(rec.alignCrop(big, row)).flatten()
+                        emb = e / (float((e * e).sum()) ** 0.5 + 1e-9)
+                    embs.append(emb)
             else:
                 for d in (det.process(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)).detections or []):
                     bb = d.location_data.relative_bounding_box
                     boxes.append((bb.xmin, bb.ymin, bb.width, bb.height))
             rgb = cv2.cvtColor(big, cv2.COLOR_BGR2RGB)
             faces = []
-            for x, y, bw, bh in boxes:
+            for k, (x, y, bw, bh) in enumerate(boxes):
                 x0, y0 = max(0, int(x * W_)), max(0, int(y * H_))
                 x1, y1 = min(W_, int((x + bw) * W_)), min(H_, int((y + bh) * H_))
                 px, py = int((x1 - x0) * 0.3), int((y1 - y0) * 0.3)
@@ -1429,7 +1443,8 @@ def sample_faces(src, start, dur, fps=5):
                     if m.multi_face_landmarks:
                         pts = m.multi_face_landmarks[0].landmark
                         gap = abs(pts[13].y - pts[14].y)       # inner lip top/bottom
-                faces.append({"cx": x + bw / 2, "cy": y + bh / 2, "w": bw, "h": bh, "gap": gap})
+                faces.append({"cx": x + bw / 2, "cy": y + bh / 2, "w": bw, "h": bh, "gap": gap,
+                              "emb": embs[k] if embs else None})
             frames.append(faces)
         mesh.close()
         return frames
@@ -1458,6 +1473,112 @@ def speaker_turns(words, start, end, min_len=1.2):
         else:
             out.append(t)
     return [tuple(t) for t in out]
+
+
+def face_tracks(frames, fps, a, b):
+    """Faces within one shot [a, b) linked into tracks [{cx, cy, pts:
+    [(t, face)]}]. Matched on x AND y with a tolerance scaled to face size:
+    with every person at a panel table detected, neighbours sit ~8% of the
+    frame apart - x alone within 8% merged them."""
+    tracks = []
+    for i in range(len(frames)):
+        if not a <= i / fps < b:
+            continue
+        for x in frames[i]:
+            tr = next((t for t in tracks if abs(t["cx"] - x["cx"]) < max(0.03, 0.6 * x["w"])
+                       and abs(t["cy"] - x["cy"]) < max(0.05, 0.8 * x["h"])), None)
+            if tr is None:
+                tr = {"cx": x["cx"], "cy": x["cy"], "pts": []}
+                tracks.append(tr)
+            tr["pts"].append((i / fps, x))
+            tr["cx"], tr["cy"] = x["cx"], x["cy"]
+    return tracks
+
+
+ASD_REPO = ROOT / "models" / "Light-ASD"
+
+
+def speaking_scores(src, wav, start, dur, frames, cuts, fps=5):
+    """Light-ASD (asd.py, in .venv-diar): adds "asd" to every face in
+    frames, a speaking score (> 0 = this face is the one talking) from lip
+    crops at 25 fps read together with the audio. Mouth-opening variance
+    couldn't tell talking from laughing, or read a bearded host behind a
+    mic. Leaves frames untouched if the model or venv is missing."""
+    import numpy as np
+    import cv2
+    if not frames or not DIAR_PY.exists() or not (ASD_REPO / "weight").exists():
+        return
+    R = 25
+    probe = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+         "-of", "json", str(src)], capture_output=True, text=True, check=True).stdout)["streams"][0]
+    W_ = min(1920, probe["width"])
+    H_ = round(probe["height"] * W_ / probe["width"] / 2) * 2
+    bounds = [0.0, *[c for c in cuts if 0 < c < dur], dur]
+    plans = []                               # (track, first frame, cx, cy, half-size) per 25 fps frame
+    for a, b in zip(bounds, bounds[1:]):
+        for t in face_tracks(frames, fps, a, b):
+            if len(t["pts"]) < 5:            # under a second of face: nothing to judge
+                continue
+            ts = [tt for tt, _ in t["pts"]]
+            f0, f1 = round(ts[0] * R), min(round(b * R), round(ts[-1] * R) + R // fps)
+            ft = np.arange(f0, f1) / R
+            cx = np.interp(ft, ts, [p["cx"] * W_ for _, p in t["pts"]])
+            cy = np.interp(ft, ts, [p["cy"] * H_ for _, p in t["pts"]])
+            hs = np.interp(ft, ts, [max(p["w"] * W_, p["h"] * H_) / 2 for _, p in t["pts"]])
+            plans.append((t, f0, cx, cy, hs, []))
+    if not plans:
+        return
+    # Light-ASD's own crop (Columbia_test.py): box widened by 0.4 per side,
+    # grey, 224 px, centre 112 px
+    proc = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
+         "-vf", f"fps={R},scale={W_}:{H_},format=gray", "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
+    i = 0
+    while True:
+        buf = proc.stdout.read(W_ * H_)
+        if len(buf) < W_ * H_:
+            break
+        img = np.frombuffer(buf, np.uint8).reshape(H_, W_)
+        for t, f0, cx, cy, hs, crops in plans:
+            k = i - f0
+            if 0 <= k < len(cx):
+                bs = hs[k]
+                x0, x1 = int(cx[k] - bs * 1.4), int(cx[k] + bs * 1.4)
+                y0, y1 = int(cy[k] - bs), int(cy[k] + bs * 1.8)
+                face = np.full((y1 - y0, x1 - x0), 110, np.uint8)
+                sx0, sy0, sx1, sy1 = max(0, x0), max(0, y0), min(W_, x1), min(H_, y1)
+                if sx1 > sx0 and sy1 > sy0:
+                    face[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+                crops.append(cv2.resize(face, (224, 224))[56:168, 56:168])
+        i += 1
+    proc.wait()
+    audio = (load_audio(wav, start, dur) * 32767).astype(np.int16)
+    tmp = Path(tempfile.mkdtemp(prefix="clipasd_"))
+    try:
+        arrs = {"audio": audio}
+        for k, (_, f0, _, _, _, crops) in enumerate(plans):
+            if crops:
+                arrs[f"t{k}"], arrs[f"s{k}"] = np.stack(crops), np.array(f0)
+        np.savez(tmp / "in.npz", **arrs)
+        r = subprocess.run([str(DIAR_PY), str(ROOT / "asd.py"), str(tmp / "in.npz"), str(tmp / "out.npz")],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            log(f"    speaker detection failed ({r.stderr.strip()[-120:]}) - using mouth motion")
+            return
+        out = np.load(tmp / "out.npz")
+        for k, (t, f0, *_) in enumerate(plans):
+            if f"t{k}" not in out.files:
+                continue
+            s = out[f"t{k}"]
+            for tt, p in t["pts"]:
+                j = round(tt * R) - f0
+                w = s[max(0, j - 2):j + 3]   # Columbia's +-2 frame smoothing
+                w = w[~np.isnan(w)]
+                if len(w):
+                    p["asd"] = float(w.mean())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _even(v):
@@ -1509,6 +1630,104 @@ def plan_layout(frames, fps, cuts, turns, dur, sw, sh, center=False):
     centre = rect_r(0.5, 0.5, 1.0)
     bounds = [0.0, *[c for c in cuts if 0 < c < dur], dur]
     shots = [(a, b) for a, b in zip(bounds, bounds[1:]) if b - a > 1e-3]
+
+    def shot_tracks(a, b):
+        tracks = face_tracks(frames, fps, a, b)
+        # Persistence: a face seen in under a quarter of the shot is a false
+        # alarm (fire in B-roll, a face on a phone screen), not a person.
+        n = sum(1 for i in range(len(frames)) if a <= i / fps < b)
+        tracks = [t for t in tracks if len(t["pts"]) >= max(2, 0.25 * n)]
+        for t in tracks:
+            t["cx"] = statistics.median(p["cx"] for _, p in t["pts"])
+            t["cy"] = statistics.median(p["cy"] for _, p in t["pts"])
+            t["w"] = statistics.median(p["w"] for _, p in t["pts"])
+            g = [p["gap"] for _, p in t["pts"] if p["gap"] is not None]
+            t["talk"] = statistics.pvariance(g) if len(g) >= 3 else 0.0
+            es = [p["emb"] for _, p in t["pts"] if p.get("emb") is not None]
+            t["emb"] = sum(es) / len(es) if es else None
+            t["id"] = None
+        return tracks
+
+    step = 1.5 / fps
+
+    def diffs(t):
+        """Frame-to-frame lip-gap changes [(t1, t2, |d|)] - mouth motion."""
+        pts = sorted((tt, p["gap"]) for tt, p in t["pts"] if p["gap"] is not None)
+        return [(t1, t2, abs(g2 - g1)) for (t1, g1), (t2, g2) in zip(pts, pts[1:]) if t2 - t1 <= step]
+
+    def link(cands, sp_turns, sp):
+        """The face (or identity) that owns voice sp - only as a clear winner:
+        its mouth moves >= 3x more while sp talks than otherwise, and >= 1.5x
+        more than the runner-up (ratios, eps-stabilised). An off-camera
+        speaker otherwise got whichever neighbour happened to move."""
+        eps, scores = 0.0005, []
+        on = lambda tt: any(t0 <= tt < t1 for t0, t1, s_ in sp_turns if s_ == sp)  # noqa: E731
+        for key, ds in cands:
+            d_in = [d for t1, t2, d in ds if on(t1) and on(t2)]
+            d_out = [d for t1, t2, d in ds if not on(t1) and not on(t2)]
+            if len(d_in) >= 2:
+                m_out = statistics.mean(d_out) if len(d_out) >= 2 else 0.0
+                scores.append(((statistics.mean(d_in) + eps) / (m_out + eps), key))
+        scores.sort(key=lambda x: -x[0])
+        if len(scores) >= 2 and scores[0][0] >= 3 and scores[0][0] >= 1.5 * scores[1][0]:
+            return scores[0][1]
+        return None
+
+    def speaking(pts, s0=-1.0, s1=1e9):
+        """Mean Light-ASD score of these (t, face) samples in [s0, s1), or None."""
+        v = [p["asd"] for tt, p in pts if s0 <= tt < s1 and p.get("asd") is not None]
+        return statistics.mean(v) if len(v) >= 2 else None
+
+    def asd_link(cands, sp_turns, sp):
+        """Like link(), on speaking scores: the candidate whose score RISES
+        while sp talks (vs. while others talk) by >= ASD_MARGIN, and clearly
+        more than the runner-up's. Contrast, not level: a mic in front of a
+        guest's mouth held her score below zero even while she talked."""
+        on = lambda tt: any(t0 <= tt < t1 for t0, t1, s_ in sp_turns if s_ == sp)  # noqa: E731
+        other = lambda tt: any(t0 <= tt < t1 for t0, t1, s_ in sp_turns if s_ != sp)  # noqa: E731
+        scores = []
+        for key, pts in cands:
+            m_in = speaking([q for q in pts if on(q[0])])
+            if m_in is None:
+                continue
+            m_out = speaking([q for q in pts if other(q[0])])
+            scores.append((m_in - m_out if m_out is not None else m_in, key))
+        scores.sort(key=lambda x: -x[0])
+        if scores and scores[0][0] >= ASD_MARGIN and (len(scores) == 1 or scores[0][0] - scores[1][0] >= ASD_MARGIN / 2):
+            return scores[0][1]
+        return None
+
+    pre = {} if center or not frames else {s: shot_tracks(*s) for s in shots}
+    has_asd = any(p.get("asd") is not None for f in frames for p in f)
+    # Identity across shots (SFace): a multi-cam show cuts every 2-5 s, too
+    # little mouth motion per shot to tell who talks - the host's 2 s
+    # question never cleared the bar, so the crop stayed on the guest. Faces
+    # are grouped into people over the whole clip and each voice is linked
+    # to a person on all of their footage at once. Two faces in one shot are
+    # never the same person.
+    people = []
+    for s, trs in pre.items():
+        for t in sorted(trs, key=lambda t: -len(t["pts"])):
+            if t["emb"] is None:
+                continue
+            e = t["emb"] / (float((t["emb"] * t["emb"]).sum()) ** 0.5 + 1e-9)
+            sim, k = max(((float(e @ p["emb"]) / (float((p["emb"] * p["emb"]).sum()) ** 0.5 + 1e-9), k)
+                          for k, p in enumerate(people) if s not in p["shots"]), default=(0.0, None))
+            if sim < SAME_FACE:
+                k = len(people)
+                people.append({"emb": 0 * e, "shots": set(), "diffs": []})
+            people[k]["emb"] = people[k]["emb"] + e
+            people[k]["shots"].add(s)
+            people[k]["diffs"] += diffs(t)
+            people[k].setdefault("pts", []).extend(t["pts"])
+            t["id"] = k
+    person_of = {}
+    for sp in {sp for _, _, sp in turns}:
+        k = asd_link([(k, p["pts"]) for k, p in enumerate(people)], turns, sp) if has_asd else \
+            link([(k, p["diffs"]) for k, p in enumerate(people)], turns, sp)
+        if k is not None:
+            person_of[sp] = k
+
     segs, spoke, seen, cut_faces = [], 0.0, 0.0, 0
     for a, b in shots:
         fr = [frames[i] for i in range(len(frames)) if a <= i / fps < b]
@@ -1518,34 +1737,11 @@ def plan_layout(frames, fps, cuts, turns, dur, sw, sh, center=False):
         if not fr:                          # shot shorter than one sample: keep previous framing
             segs.append((a, b, *segs[-1][2:]) if segs else (a, b, "R", [centre]))
             continue
-        # face tracks within the shot. Matched on x AND y with a tolerance
-        # scaled to face size: with every person at a panel table detected,
-        # neighbours sit ~8% of the frame apart - x alone within 8% merged them.
-        tracks = []
-        for i in range(len(frames)):
-            if not a <= i / fps < b:
-                continue
-            for x in frames[i]:
-                tr = next((t for t in tracks if abs(t["cx"] - x["cx"]) < max(0.03, 0.6 * x["w"])
-                           and abs(t["cy"] - x["cy"]) < max(0.05, 0.8 * x["h"])), None)
-                if tr is None:
-                    tr = {"cx": x["cx"], "cy": x["cy"], "pts": []}
-                    tracks.append(tr)
-                tr["pts"].append((i / fps, x))
-                tr["cx"], tr["cy"] = x["cx"], x["cy"]
-        # Persistence: a face seen in under a quarter of the shot is a false
-        # alarm (fire in B-roll, a face on a phone screen), not a person.
-        tracks = [t for t in tracks if len(t["pts"]) >= max(2, 0.25 * len(fr))]
+        tracks = pre[(a, b)]
         covered = {round(tt * fps) for t in tracks for tt, _ in t["pts"]}
         if not tracks or len(covered) / len(fr) < 0.4:
             segs.append((a, b, "F", []))
             continue
-        for t in tracks:
-            t["cx"] = statistics.median(p["cx"] for _, p in t["pts"])
-            t["cy"] = statistics.median(p["cy"] for _, p in t["pts"])
-            t["w"] = statistics.median(p["w"] for _, p in t["pts"])
-            g = [p["gap"] for _, p in t["pts"] if p["gap"] is not None]
-            t["talk"] = statistics.pvariance(g) if len(g) >= 3 else 0.0
         # Facecam: a small face pinned near an edge for most of the shot whose
         # mouth moves. Judged per track - a game HUD's static character
         # portrait sits at the same edge (Jynxzi/R6) and never talks.
@@ -1586,40 +1782,36 @@ def plan_layout(frames, fps, cuts, turns, dur, sw, sh, center=False):
         # Picking the busiest mouth per turn (by_var) broke once every
         # person at a panel table was detected: a neighbour laughing or
         # drinking out-moved the actual speaker in short windows.
-        step = 1.5 / fps
-
-        def motion(t, keep):
-            pts = sorted((tt, p["gap"]) for tt, p in t["pts"] if p["gap"] is not None)
-            d = [abs(g2 - g1) for (t1, g1), (t2, g2) in zip(pts, pts[1:])
-                 if t2 - t1 <= step and keep(t1) and keep(t2)]
-            return statistics.mean(d) if len(d) >= 2 else None
-
         shot_turns = [(max(a, t0), min(b, t1), sp) for t0, t1, sp in turns if t1 > a and t0 < b]
-        # A face owns a voice only as a clear winner: its mouth moves >= 3x
-        # more while that voice talks than otherwise, and >= 1.5x more than
-        # the runner-up (ratios, eps-stabilised). An off-camera speaker (the
-        # host, heard but not in this shot) otherwise got whichever
-        # neighbour happened to move during his 2 s.
-        eps, owner = 0.0005, {}
+        owner = {}
         for sp in {sp for _, _, sp in shot_turns}:
-            on = lambda tt, sp=sp: any(t0 <= tt < t1 for t0, t1, s_ in shot_turns if s_ == sp)
-            scores = []
-            for t in tracks:
-                m_in, m_out = motion(t, on), motion(t, lambda tt: not on(tt))
-                if m_in is not None:
-                    scores.append(((m_in + eps) / ((m_out if m_out is not None else 0.0) + eps), t))
-            scores.sort(key=lambda x: -x[0])
-            if len(scores) >= 2 and scores[0][0] >= 3 and scores[0][0] >= 1.5 * scores[1][0]:
-                owner[sp] = scores[0][1]
+            if sp in person_of:             # known person: their face here, or None = off camera
+                owner[sp] = next((t for t in tracks if t["id"] == person_of[sp]), None)
+                continue
+            t = asd_link([(t, t["pts"]) for t in tracks], shot_turns, sp) if has_asd else \
+                link([(t, diffs(t)) for t in tracks], shot_turns, sp)
+            if t is not None:
+                owner[sp] = t
 
         def talker(s0, s1):
+            # the face that is visibly talking right now wins outright -
+            # robust to a mislabeled diarization turn
+            sc = sorted(((m, t) for t in tracks if (m := speaking(t["pts"], s0, s1)) is not None),
+                        key=lambda x: -x[0])
+            if sc and sc[0][0] > 0 and (len(sc) == 1 or sc[0][0] - sc[1][0] >= ASD_MARGIN):
+                return sc[0][1]
+            best_asd = sc[0][1] if sc else None
             mid = (s0 + s1) / 2
             sp = next((s_ for t0, t1, s_ in shot_turns if t0 <= mid < t1), None)
             if sp in owner:
-                return owner[sp]
+                return owner[sp]            # None: known speaker, off camera in this shot
             # a diarized voice with no face of its own here is off camera:
             # hold the framing on a known speaker rather than guess a face
-            return None if (sp is not None and owner) else by_var(s0, s1)
+            if sp is not None and any(owner.values()):
+                return None
+            # nobody decisive and the voice unknown: the face reading most
+            # like a talker is a better guess than the busiest mouth
+            return best_asd or by_var(s0, s1)
 
         # A row of 3+ small faces at one height is a split-screen grid (news
         # panel): crop exactly one box, sized by the spacing between faces -
@@ -1668,7 +1860,9 @@ def plan_layout(frames, fps, cuts, turns, dur, sw, sh, center=False):
                 if 0.2 < inside / max(1e-6, p["w"] * W) < 0.8:
                     cut_faces += 1
     return segs, {"on_screen": round(seen / spoke, 3) if spoke else None, "cut_faces": cut_faces,
-                  "talker": round(spoke / dur, 3) if dur else 0.0}
+                  "talker": round(spoke / dur, 3) if dur else 0.0, "people": len(people),
+                  "voices": person_of,
+                  "ids": [(a, round(t["cx"], 2), t["id"]) for (a, _), trs in pre.items() for t in trs]}
 
 
 def layout_pieces(blocks, segs, start, fps):
@@ -2476,13 +2670,16 @@ def cmd_render(args):
 
         frames = [] if args.center else sample_faces(src, start, dur_in)
         cuts = [] if args.center else scene_cuts(src, start, dur_in)
+        speaking_scores(src, wd / "audio.wav", start, dur_in, frames, cuts)
         segs, qa = plan_layout(frames, 5, cuts, speaker_turns(words, start, start + dur_in),
                                dur_in, sw, sh, center=args.center)
         modes = {m: sum(1 for s_ in segs if s_[2] == m) for m in ("R", "S", "F")}
         framing = (f"{len(cuts) + 1} shot(s); crop {modes['R']}, stack {modes['S']}, fit {modes['F']}"
                    + f"; talker found {qa['talker']:.0%} of the time"
                    + (f"; speaker on screen {qa['on_screen']:.0%}" if qa["on_screen"] is not None else "")
-                   + (f"; {qa['cut_faces']} face-edge frames" if qa["cut_faces"] else ""))
+                   + (f"; {qa['cut_faces']} face-edge frames" if qa["cut_faces"] else "")
+                   + (f"; voices matched to faces {len(qa['voices'])}/{len({s_ for *_, s_ in speaker_turns(words, start, start + dur_in)})}"
+                      if qa.get("voices") is not None else ""))
         log(f"    framing: {framing}")
 
         pulses = [] if args.no_zoom else emphasis_times(audio, a0, out_words, total)

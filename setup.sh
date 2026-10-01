@@ -49,6 +49,14 @@ mkdir -p models
 [ -f models/face_detection_yunet_2023mar.onnx ] || curl -sSL -o models/face_detection_yunet_2023mar.onnx \
   "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
+echo "==> face identity (SFace, OpenCV model zoo, ~37 MB) - same person across camera angles"
+[ -f models/face_recognition_sface_2021dec.onnx ] || curl -sSL -o models/face_recognition_sface_2021dec.onnx \
+  "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+
+echo "==> active speaker detection (Light-ASD, MIT, ~4 MB weights) - which face is talking"
+[ -d models/Light-ASD ] || git clone -q --depth 1 https://github.com/Junhua-Liao/Light-ASD.git models/Light-ASD
+.venv-diar/bin/pip install python_speech_features
+
 echo "==> youtube publishing (optional)"
 pip install google-api-python-client google-auth-oauthlib
 

@@ -318,3 +318,24 @@ st = clip_stats([{"platform": "a", "final": str(i), "views_24h": str(i * 10)} fo
                 + [{"platform": "b", "final": "9"}])                     # no views: ignored
 assert st["n"] == 6 and st["groups"]["platform"]["a"] == (6, 25.0) and st["corr"]["final"] > 0.99, st
 print("ok clip log")
+
+# multi-cam panel (Whatever): split screen host|guest, then a wide shot where the guest is a small
+# face. The host's 2 s question must get the host; the guest's mic keeps her speaking score below 0
+# even while she talks - she must still be linked (contrast), and found again in the wide shot (identity)
+import numpy as _np
+_e = {k: _np.eye(128, dtype=_np.float32)[k] for k in range(4)}
+A = lambda cx, cy, w_, who, asd: dict(F(cx, cy, w_), emb=_e[who], asd=asd)
+split = [[A(0.17, 0.3, 0.07, 0, (1.0 if i < 12 else -2.0)),          # host talks 0-2.3 s
+          A(0.75, 0.4, 0.07, 1, (-0.8 if 13 <= i else -2.5)),         # guest, mic-muffled
+          A(0.43, 0.3, 0.05, 2, -2.0)] for i in range(38)]            # neighbour
+wide = [[A(0.14, 0.4, 0.03, 2, -2.0), A(0.52, 0.4, 0.03, 3, -1.5),    # pink, never talks here
+         A(0.80, 0.4, 0.03, 1, (0.5 if 3 <= i else -1.5))] for i in range(30)]
+segs, qa = plan_layout(split + wide, 5, [7.6], [(0, 2.3, "HOST"), (2.5, 7.6, "GUEST"), (8.2, 13.6, "GUEST")],
+                       13.6, 3840, 2160)
+assert qa["voices"] == {"HOST": 0, "GUEST": 1}, qa["voices"]
+at = lambda t: next(g for g in segs if g[0] <= t < g[1])
+cxs = lambda g: [(r[0] + r[2] / 2) / 3840 for r in g[3]]
+assert any(abs(c - 0.17) < 0.06 for c in cxs(at(1.0))), segs        # host framed for his question
+assert any(abs(c - 0.75) < 0.06 for c in cxs(at(5.0))), segs        # guest during her answer
+assert any(abs(c - 0.80) < 0.06 for c in cxs(at(11.0))), segs       # same guest in the wide shot, not pink
+print("ok multi-cam panel")
