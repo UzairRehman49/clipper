@@ -84,10 +84,11 @@ W, H = 1080, 1920
 OUT_W, OUT_H = W, H     # (plan_layout's W/H are the SOURCE size)
 MAX_ZOOM = 1.9          # upscale limit for crops; 2.8 for one split-screen box
 SAME_FACE = 0.363       # SFace cosine: OpenCV's published same-person threshold
+FOLLOW_OUT = 0.2        # pan when a locked crop would lose the talker's face this share of a turn
 ASD_MARGIN = 1.0        # Light-ASD logits: talker must lead the next face by this much
 CLIP_MIN, CLIP_MAX = 22, 58          # seconds
 CAND_COUNT = 30                      # how many candidates to surface per source
-FIND_VERSION = "2"                   # bump when find's inputs/signals change -> recompute
+FIND_VERSION = "3"                   # bump when find's inputs/signals change -> recompute
 EXCHANGE_MAX = 5                     # rapid speaker-change windows added per source
 HEAT_MAX = 3                         # most-replayed regions added when nothing covers them
 
@@ -1053,11 +1054,33 @@ def resonate(cands, reacts, heat):
         c["signals"] = sig
 
 
+EDGE_TAIL = 30.0        # seconds; only on videos of 5+ minutes
+EDGE_CHAPTER = re.compile(r"\b(intro|outro|teaser|preview|trailer|credits|closing|sign[- ]?off|end screen)\b", re.I)
+
+
+def video_edges(meta):
+    """[(a, b)] spans no clip may touch: a long video's last seconds are the
+    sign-off and end card ("We'll see you tomorrow." + a 16 s DraftKings
+    card on Pat McAfee), and chapters titled intro/outro/closing. No fixed
+    head cut: openings measured as real material (a stand-up special starts
+    on its first bit; no cold open repeated later, 0-8% of 5-grams)."""
+    dur = float(meta.get("duration") or 0)
+    if dur < 300:
+        return []
+    out = [(dur - EDGE_TAIL, dur)]
+    ch = meta.get("chapters") or []
+    for k, c in enumerate(ch):
+        if EDGE_CHAPTER.search(c.get("title", "")):
+            out.append((c["start_time"], ch[k + 1]["start_time"] if k + 1 < len(ch) else dur))
+    return out
+
+
 def apply_signals(cands, meta, words, reacts=()):
     """Chapter/sponsor rules, the replay-heatmap boost and the reaction /
     resonance bonus, applied to every candidate source alike. Returns the
     surviving candidates."""
     bounds, sponsor, heat = chapter_bounds(meta, words), meta.get("sponsor") or [], usable_heat(meta)
+    edges = video_edges(meta)
     out = []
     for c in cands:
         s, e = clamp_to_chapters(c["start"], c["end"], bounds)
@@ -1065,6 +1088,8 @@ def apply_signals(cands, meta, words, reacts=()):
             continue                                   # nothing usable left inside one chapter
         if sum(overlap(s, e, a, b) for a, b, _ in sponsor) > 0.3 * (e - s):
             continue                                   # mostly an ad read / intro
+        if any(overlap(s, e, a, b) > 0 for a, b in edges):
+            continue                                   # teaser intro / sign-off + end card
         c["start"], c["end"] = round(s, 2), round(e, 2)
         out.append(c)
     resonate(out, reacts, heat)
@@ -1088,7 +1113,8 @@ def apply_signals(cands, meta, words, reacts=()):
         s0, _, _ = snap_span(words, max(0.0, b["start_time"] - 5), b["start_time"] + 40, None) \
             if words else (b["start_time"], 0, 0)
         s, e = clamp_to_chapters(s0, s0 + 45, bounds)
-        if e - s < CLIP_MIN or sum(overlap(s, e, a, bb) for a, bb, _ in sponsor) > 0:
+        if e - s < CLIP_MIN or sum(overlap(s, e, a, bb) for a, bb, _ in sponsor) > 0 \
+                or any(overlap(s, e, a, bb) > 0 for a, bb in edges):
             continue
         # judge the span we'd actually add, not the bucket's midpoint - a
         # snapped span can land on a moment another candidate already covers
@@ -1351,19 +1377,25 @@ def cmd_review(args):
 
 # ------------------------------------------------------ speaker reframing ---
 
-def scene_cuts(src, start, dur, thresh=0.3):
+def scene_cuts(src, start, dur, thresh=0.3, soft=0.15):
     """Camera cuts (seconds from start) via ffmpeg's own scene score - no
     extra dependency. Crops are planned per shot and never pan across a
     cut: panning through an edit is the most obvious sign of an
-    auto-reframed video."""
-    r = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "info", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
-         "-an", "-vf", f"scale=320:-2,select='gt(scene,{thresh})',showinfo", "-f", "null", "-"],
-        capture_output=True, text=True)
+    auto-reframed video. A cut is a score >= thresh, or a lone spike >=
+    soft at least twice everything within 3 frames: a stand-up special's
+    close-up -> wide cuts on one purple stage scored only 0.19-0.23, while
+    a handheld IRL stream scores 0.1-0.3 in long runs that aren't cuts."""
+    out = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
+         "-an", "-vf", "scale=320:-2,select='gte(scene,0)',metadata=print:file=-", "-f", "null", "-"],
+        capture_output=True, text=True).stdout
+    ts = [float(x) for x in re.findall(r"pts_time:([\d.]+)", out)]
+    sc = [float(x) for x in re.findall(r"scene_score=([\d.]+)", out)]
     cuts = []
-    for m in re.finditer(r"pts_time:([\d.]+)", r.stderr):
-        t = float(m.group(1))
-        if t > 0.4 and (not cuts or t - cuts[-1] > 0.5):
+    for i, (t, s) in enumerate(zip(ts, sc)):
+        near = sc[max(0, i - 3):i] + sc[i + 1:i + 4]
+        if (s >= thresh or (s >= soft and max(near, default=0.0) < 0.5 * s)) \
+                and t > 0.4 and (not cuts or t - cuts[-1] > 0.5):
             cuts.append(round(t, 2))
     return cuts
 
@@ -1627,6 +1659,29 @@ def plan_layout(frames, fps, cuts, turns, dur, sw, sh, center=False):
         y = min(max(0, cy * H - rh * 0.4), H - rh)
         return (_even(x), _even(y), _even(rw), _even(rh))
 
+    def follow_path(tr, s0, s1, r):
+        """[(t, x)] crop-left keyframes panning with a moving face, or None
+        when the locked crop r already holds it. Pans only if the face would
+        leave r in > FOLLOW_OUT of the turn: a seated host leaning or a
+        comedian pacing inside the box keeps the locked crop (reads as a
+        camera; a panning one reads as a phone). Smoothed over ~1.4 s so it
+        glides rather than twitches; flat stretches thinned to few keyframes."""
+        rw = r[2]
+        own = [p for tt, p in tr["pts"] if s0 <= tt < s1]
+        outside = sum(1 for p in own if (p["cx"] - p["w"] / 2) * W < r[0] or (p["cx"] + p["w"] / 2) * W > r[0] + rw)
+        if len(own) < 4 or outside <= FOLLOW_OUT * len(own):
+            return None
+        pts = sorted((tt, p["cx"] * W) for tt, p in tr["pts"] if s0 - 0.6 <= tt < s1 + 0.6)
+        xs = [x for _, x in pts]
+        sm = [(tt, statistics.mean(xs[max(0, k - 3):k + 4])) for k, (tt, _) in enumerate(pts)]
+        keys = [(round(tt, 2), _even(min(max(0.0, x - rw / 2), W - rw))) for tt, x in sm]
+        out = [keys[0]]
+        for k in range(1, len(keys) - 1):    # drop keyframes a straight line already hits
+            (t0, x0), (t1, x1), (t2, x2) = out[-1], keys[k], keys[k + 1]
+            if abs(x0 + (x2 - x0) * (t1 - t0) / max(1e-6, t2 - t0) - x1) > 6:
+                out.append(keys[k])
+        return out + [keys[-1]] if len(keys) > 1 else out
+
     centre = rect_r(0.5, 0.5, 1.0)
     bounds = [0.0, *[c for c in cuts if 0 < c < dur], dur]
     shots = [(a, b) for a, b in zip(bounds, bounds[1:]) if b - a > 1e-3]
@@ -1836,7 +1891,11 @@ def plan_layout(frames, fps, cuts, turns, dur, sw, sh, center=False):
         for s0, s1, tr, _ in subs:
             share[id(tr)] = share.get(id(tr), 0) + (s1 - s0)
         top = sorted(tracks, key=lambda t: -share.get(id(t), 0))[:2]
-        if len(top) == 2 and all(share.get(id(t), 0) >= 0.25 * (b - a) for t in top) \
+        # handheld/IRL: people drift across a single long take, so two
+        # locked boxes lose them (Speed walked out of his half of a stack)
+        moving = any(max(p["cx"] for _, p in t["pts"]) - min(p["cx"] for _, p in t["pts"]) > 0.12
+                     for t in top)
+        if len(top) == 2 and not moving and all(share.get(id(t), 0) >= 0.25 * (b - a) for t in top) \
                 and abs(top[0]["cx"] - top[1]["cx"]) * W > 0.9 * full_w:
             first = next(tr for _, _, tr, _ in subs if any(tr is t for t in top))
             pair = [first, top[1] if first is top[0] else top[0]]
@@ -1846,23 +1905,50 @@ def plan_layout(frames, fps, cuts, turns, dur, sw, sh, center=False):
         prev = None
         for s0, s1, tr, known in subs:
             r = rect_r(tr["cx"], tr["cy"], tr["w"], cap)
-            if prev and abs((prev[0] + prev[2] / 2) - (r[0] + r[2] / 2)) < 0.06 * W and prev[2] == r[2]:
-                r = prev                    # same place: don't nudge the camera
-            if segs and segs[-1][2] == "R" and segs[-1][3][0] == r and segs[-1][1] == s0:
-                segs[-1] = (segs[-1][0], s1, "R", [r])
+            path = follow_path(tr, s0, s1, r)
+            if path:                        # moving subject: the crop pans with them
+                segs.append((s0, s1, "R", [r], path))
+                prev = None
             else:
-                segs.append((s0, s1, "R", [r]))
-            prev = r
-            if known and r[0] <= tr["cx"] * W <= r[0] + r[2]:
+                if prev and abs((prev[0] + prev[2] / 2) - (r[0] + r[2] / 2)) < 0.06 * W and prev[2] == r[2]:
+                    r = prev                # same place: don't nudge the camera
+                if segs and segs[-1][2] == "R" and len(segs[-1]) == 4 and segs[-1][3][0] == r and segs[-1][1] == s0:
+                    segs[-1] = (segs[-1][0], s1, "R", [r])
+                else:
+                    segs.append((s0, s1, "R", [r]))
+                prev = r
+            x_at = (lambda tt: path_x(path, tt)) if path else (lambda tt: r[0])
+            if known and x_at((s0 + s1) / 2) <= tr["cx"] * W <= x_at((s0 + s1) / 2) + r[2]:
                 seen += s1 - s0
             for tt, p in [q for t in tracks for q in t["pts"] if s0 <= q[0] < s1]:
-                inside = max(0.0, min(r[0] + r[2], (p["cx"] + p["w"] / 2) * W) - max(r[0], (p["cx"] - p["w"] / 2) * W))
+                x0 = x_at(tt)
+                inside = max(0.0, min(x0 + r[2], (p["cx"] + p["w"] / 2) * W) - max(x0, (p["cx"] - p["w"] / 2) * W))
                 if 0.2 < inside / max(1e-6, p["w"] * W) < 0.8:
                     cut_faces += 1
     return segs, {"on_screen": round(seen / spoke, 3) if spoke else None, "cut_faces": cut_faces,
                   "talker": round(spoke / dur, 3) if dur else 0.0, "people": len(people),
                   "voices": person_of,
                   "ids": [(a, round(t["cx"], 2), t["id"]) for (a, _), trs in pre.items() for t in trs]}
+
+
+def path_x(path, t):
+    """Crop-left x at time t on a [(t, x)] keyframe path (held at the ends)."""
+    if t <= path[0][0]:
+        return path[0][1]
+    for (t0, x0), (t1, x1) in zip(path, path[1:]):
+        if t < t1:
+            return x0 + (x1 - x0) * (t - t0) / max(1e-6, t1 - t0)
+    return path[-1][1]
+
+
+def path_expr(path, off):
+    """path_x as an ffmpeg expression in a piece's input time t (clip time =
+    t + off) - crop evaluates x per frame."""
+    pts = [(tc - off, x) for tc, x in path]
+    e = str(pts[-1][1])
+    for (t0, x0), (t1, x1) in reversed(list(zip(pts, pts[1:]))):
+        e = f"if(lt(t,{t1:.3f}),{x0}+({x1 - x0})*(t-{t0:.3f})/{max(1e-3, t1 - t0):.3f},{e})"
+    return f"if(lt(t,{pts[0][0]:.3f}),{pts[0][1]},{e})"
 
 
 def layout_pieces(blocks, segs, start, fps):
@@ -1892,8 +1978,9 @@ def layout_pieces(blocks, segs, start, fps):
     return [(p[0], [(a - p[0], b - p[0]) for a, b in p[1]], segs[p[2]]) for p in pieces]
 
 
-def piece_filter(i, spans, seg, fps):
-    """Filter chain for one piece -> [v{i}] 1080x1920 and [a{i}]."""
+def piece_filter(i, spans, seg, fps, off=0.0):
+    """Filter chain for one piece -> [v{i}] 1080x1920 and [a{i}]. off = the
+    piece's seek point in clip time (for a panning crop's path)."""
     h = 0.5 / fps                            # half-frame: exactly (b-a)*fps frames
     vsel = "+".join(f"gte(t,{a - h:.4f})*lt(t,{b - h:.4f})" for a, b in spans)
     asel = "+".join(f"gte(t,{a:.4f})*lt(t,{b:.4f})" for a, b in spans)
@@ -1904,7 +1991,11 @@ def piece_filter(i, spans, seg, fps):
     head = (f"[{i}:v]select='{vsel}',setpts=N/FRAME_RATE/TB,"
             f"tpad=stop_mode=clone:stop=3,trim=end_frame={n}")
     mode, rects = seg[2], seg[3]
-    if mode == "R":
+    if mode == "R" and len(seg) > 4:          # panning crop: on input time, before select retimes
+        x, y, w, hh = rects[0]
+        v = (f"[{i}:v]crop={w}:{hh}:'{path_expr(seg[4], off)}':{y},"
+             f"{head[len(f'[{i}:v]'):]},scale={W}:{H}:flags=lanczos,setsar=1[v{i}]")
+    elif mode == "R":
         x, y, w, hh = rects[0]
         v = f"{head},crop={w}:{hh}:{x}:{y},scale={W}:{H}:flags=lanczos,setsar=1[v{i}]"
     elif mode == "S":
@@ -2481,6 +2572,17 @@ def snap_span(words, s, e, loop):
         return en[k] if k < len(en) and en[k] - t <= lim else t
 
     s2, e2 = back(s, 12), fwd(e, 5)
+    # The judge's times are phrase STARTS, so an out-point on a sentence's
+    # first word normally means "include it" (forward is right: "Hit the
+    # brakes!"). Not across a long non-speech gap into another speaker,
+    # though: that ran a street interview through a 7 s title card into the
+    # next interviewee's question, which then became the hook.
+    ws = [w["s"] for w in words]
+    k = bisect.bisect_right(en, e + 1e-3) - 1
+    j = bisect.bisect_right(ws, en[k]) if k >= 0 else len(words)
+    if j < len(words) and j == bisect.bisect_left(ws, e - 0.05) and words[j]["s"] - en[k] > 3 \
+            and words[j].get("spk") != words[j - 1].get("spk"):
+        e2 = en[k]
     if s2 == s:
         # Nothing within 12s. Reach further back for the setup - on a
         # debate show the answer ("stay the f*** home") needs the question
@@ -2674,7 +2776,9 @@ def cmd_render(args):
         segs, qa = plan_layout(frames, 5, cuts, speaker_turns(words, start, start + dur_in),
                                dur_in, sw, sh, center=args.center)
         modes = {m: sum(1 for s_ in segs if s_[2] == m) for m in ("R", "S", "F")}
-        framing = (f"{len(cuts) + 1} shot(s); crop {modes['R']}, stack {modes['S']}, fit {modes['F']}"
+        pans = sum(1 for s_ in segs if len(s_) > 4)
+        framing = (f"{len(cuts) + 1} shot(s); crop {modes['R']}" + (f" ({pans} panning)" if pans else "")
+                   + f", stack {modes['S']}, fit {modes['F']}"
                    + f"; talker found {qa['talker']:.0%} of the time"
                    + (f"; speaker on screen {qa['on_screen']:.0%}" if qa["on_screen"] is not None else "")
                    + (f"; {qa['cut_faces']} face-edge frames" if qa["cut_faces"] else "")
@@ -2700,7 +2804,7 @@ def cmd_render(args):
         pieces = layout_pieces(blocks, segs, start, fps)
         for i, (seek, spans, seg) in enumerate(pieces):
             inputs += ["-ss", f"{seek:.3f}", "-t", f"{spans[-1][1] + 0.3:.3f}", "-i", str(src)]
-            fc.append(piece_filter(i, spans, seg, fps))
+            fc.append(piece_filter(i, spans, seg, fps, seek - start))
         n = len(pieces)
         fc.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
         zoom = "" if args.no_zoom else (

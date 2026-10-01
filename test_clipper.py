@@ -75,6 +75,16 @@ s, e, _ = snap_span(ws, ws[4]["s"], ws[5]["e"], None)          # picked "religio
 assert (s, e) == (ws[3]["s"], ws[6]["e"]), (s, e)             # -> "Force ... kids."
 print("ok snap span")
 
+# out-point on the next speaker's first word after a 7 s title card: end the answer, don't run on
+ti = [dict(w("So", 19.2, 19.3), spk="G"), dict(w("it", 19.5, 19.7), spk="G"), dict(w("depends.", 19.7, 20.4), spk="G"),
+      dict(w("You", 27.7, 28.2), spk="I"), dict(w("haven't", 28.2, 28.4), spk="I"), dict(w("shared?", 28.4, 30.2), spk="I")]
+assert snap_span(ti, 19.2, 27.7, None)[1] == 20.4, snap_span(ti, 19.2, 27.7, None)
+assert snap_span(ti, 19.2, 28.3, None)[1] == 30.2                # mid-sentence: still finishes it
+for x in ti[3:]:
+    x["spk"] = "G"                                               # same speaker after the pause: include it
+assert snap_span(ti, 19.2, 27.7, None)[1] == 30.2
+print("ok snap end")
+
 # hook menu: whole clauses of 3-12 words, split at punctuation and speaker changes
 from clipper import clauses
 ws = [dict(w(t, i, i + 0.5), spk=("S1" if i < 8 else "S2")) for i, t in enumerate(
@@ -339,3 +349,27 @@ assert any(abs(c - 0.17) < 0.06 for c in cxs(at(1.0))), segs        # host frame
 assert any(abs(c - 0.75) < 0.06 for c in cxs(at(5.0))), segs        # guest during her answer
 assert any(abs(c - 0.80) < 0.06 for c in cxs(at(11.0))), segs       # same guest in the wide shot, not pink
 print("ok multi-cam panel")
+
+# a long video's sign-off/end card and "closing" chapters are off limits; its opening is not
+from clipper import video_edges
+ed = video_edges({"duration": 600, "chapters": [{"start_time": 0, "title": "Disclosing partner count"},
+                                               {"start_time": 500, "title": "Closing remarks"}]})
+assert ed == [(570.0, 600.0), (500, 600.0)], ed
+assert video_edges({"duration": 200}) == []                          # short video: nothing
+print("ok video edges")
+
+# IRL: one long take, the talker walks across the frame - the crop pans with him (smoothly, ends
+# held), no two-box stack; a seated talker still gets one locked crop
+from clipper import path_x, path_expr
+walk = [[F(0.2 + 0.6 * i / 49, 0.4, 0.06, talk(i)), F(0.85, 0.4, 0.06, 0.02)] for i in range(50)]
+segs, _ = plan_layout(walk, 5, [], [(0, 10, "A")], 10.0, 1920, 1080)
+assert len(segs) == 1 and segs[0][2] == "R" and len(segs[0]) == 5, segs
+path, rw = segs[0][4], segs[0][3][0][2]
+assert path_x(path, 1.0) + rw / 2 < path_x(path, 9.0) + rw / 2, path     # moves right with him
+assert abs(path_x(path, 5.0) + rw / 2 - 0.5 * 1920) < 0.08 * 1920, path_x(path, 5.0)
+assert all(abs(b[1] - a[1]) / (b[0] - a[0]) < 0.2 * 1920 for a, b in zip(path, path[1:])), path  # glides
+assert path_expr([(0, 10), (2, 30)], 1.0) == "if(lt(t,-1.000),10,if(lt(t,1.000),10+(20)*(t--1.000)/2.000,30))"
+still = [[F(0.42, 0.4, 0.06, talk(i))] for i in range(30)]
+assert len(plan_layout(still, 5, [], [(0, 6, "A")], 6.0, 1920, 1080)[0][0]) == 4    # locked
+print("ok follow")
+
