@@ -2313,7 +2313,10 @@ for _line in ((ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists
     _k, _, _v = _line.partition("=")
     if _k.strip() and not _line.lstrip().startswith("#"):
         os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
-JUDGE = os.environ.get("CLIPPER_JUDGE", "claude" if os.environ.get("ANTHROPIC_API_KEY") else "local")
+# Claude without an API key: the Claude Code CLI's print mode runs on the
+# user's Claude login (plan usage, no key). Used when no key is set.
+CLAUDE_CLI = shutil.which("claude")
+JUDGE = os.environ.get("CLIPPER_JUDGE", "claude" if os.environ.get("ANTHROPIC_API_KEY") or CLAUDE_CLI else "local")
 JUDGE_MODEL = os.environ.get("CLIPPER_JUDGE_MODEL", "claude-opus-5-5")
 JUDGE_LOG = ROOT / "logs" / "judge_data.jsonl"
 _judge_lock = threading.Lock()
@@ -2324,7 +2327,10 @@ def judge_name():
 
 
 def claude(prompt, system, max_tokens=1500, tries=4):
-    """One Messages API call -> (text, usage). Retries rate limits/overload."""
+    """One Claude call -> (text, usage): the Messages API with a key, else
+    the Claude Code CLI (`claude -p`) on the user's login."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return claude_cli(prompt, system, tries)
     body = json.dumps({"model": JUDGE_MODEL, "max_tokens": max_tokens, "system": system,
                        "messages": [{"role": "user", "content": prompt}]}).encode()
     for attempt in range(1, tries + 1):
@@ -2346,6 +2352,30 @@ def claude(prompt, system, max_tokens=1500, tries=4):
                 time.sleep(5 * attempt)
                 continue
             raise RuntimeError(f"Claude API unreachable: {e}") from e
+
+
+def claude_cli(prompt, system, tries=3):
+    """`claude -p` as a bare model call: no tools, no MCP, no settings/hooks/
+    memory (--setting-sources ""), run outside the project so no CLAUDE.md
+    rides along - measured 506 input tokens for a small prompt vs 2,368 with
+    the user's settings loaded."""
+    if not CLAUDE_CLI:
+        raise RuntimeError("no ANTHROPIC_API_KEY and no `claude` CLI on PATH")
+    cmd = [CLAUDE_CLI, "-p", "--output-format", "json", "--model", JUDGE_MODEL, "--system-prompt", system,
+           "--tools", "", "--no-session-persistence", "--strict-mcp-config", "--setting-sources", ""]
+    for attempt in range(1, tries + 1):
+        try:
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=300,
+                               cwd=tempfile.gettempdir())
+            d = json.loads(r.stdout)
+            if not d.get("is_error"):
+                return d.get("result", ""), d.get("usage", {})
+            err = d.get("result") or r.stderr
+        except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+            err = str(e)
+        if attempt < tries:
+            time.sleep(10 * attempt)
+    raise RuntimeError(f"claude CLI: {str(err)[:300]}")
 
 
 def judge_json(prompt, system, tag=""):

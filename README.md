@@ -213,13 +213,16 @@ system that compounds.
 
 ## Known constraints
 
-- **The judge (which moments to keep, where to cut) runs on Claude** when
-  `ANTHROPIC_API_KEY` is set, either in your environment or in a git-ignored
-  `.env` file next to `clipper.py` as `ANTHROPIC_API_KEY=...`.
-  `CLIPPER_JUDGE_MODEL` picks the model (default `claude-opus-5-5`).
-  Without a key, or if the API fails, it uses the local model. Everything
-  else stays local. The local 14B model agreed with a careful manual
-  ranking at only +0.46.
+- **The judge (which moments to keep, where to cut) runs on Claude.** With
+  `ANTHROPIC_API_KEY` set (in your environment, or a git-ignored `.env` as
+  `ANTHROPIC_API_KEY=...`) it uses the API. Without a key it uses the
+  Claude Code CLI (`claude -p`) on your Claude login, run bare: no tools, no
+  settings, no project context. `CLIPPER_JUDGE_MODEL` picks the model
+  (default `claude-opus-5-5`). `CLIPPER_JUDGE=local` forces the local model,
+  which is also the fallback if Claude fails. Measured: ~7 s per judgment,
+  ~1.6k input + 0.4k output tokens each. Claude is far stricter than the
+  local 14B (street interviews: 3/10 kept vs 9/10), which agreed with a
+  careful manual ranking at only +0.46.
 - **Every judge call is logged** to `logs/judge_data.jsonl`. Claude's verdicts
   are the training set for the local model:
   `.venv-train/bin/python train_judge.py` (LoRA on Qwen3-14B via mlx-lm,
