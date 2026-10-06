@@ -2369,7 +2369,7 @@ def claude_cli(prompt, system, tries=3):
                                cwd=tempfile.gettempdir())
             d = json.loads(r.stdout)
             if not d.get("is_error"):
-                return d.get("result", ""), d.get("usage", {})
+                return d.get("result", ""), {**d.get("usage", {}), "cost_usd": d.get("total_cost_usd")}
             err = d.get("result") or r.stderr
         except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
             err = str(e)

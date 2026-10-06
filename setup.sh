@@ -65,33 +65,98 @@ echo "==> youtube publishing (optional)"
 pip install google-api-python-client google-auth-oauthlib
 
 mkdir -p sources work out logs
+touch .env && chmod 600 .env          # settings + keys; git-ignored
+
+set_env() {   # set_env KEY VALUE - replace or add one line in .env
+  grep -v "^$1=" .env > .env.tmp || true
+  echo "$1=$2" >> .env.tmp && mv .env.tmp .env && chmod 600 .env
+}
+
+# ---------------------------------------------------------------- memory --
+RAM_GB=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
+if   (( RAM_GB < 20 )); then REC="qwen3-8b";        TIER="16 GB"
+elif (( RAM_GB < 30 )); then REC="qwen3-14b";       TIER="24 GB"
+elif (( RAM_GB < 44 )); then REC="qwen3-30b-a3b";   TIER="32-36 GB"
+elif (( RAM_GB < 60 )); then REC="qwen3-32b";       TIER="48 GB"
+elif (( RAM_GB < 120 )); then REC="llama-3.3-70b-instruct"; TIER="64-96 GB"
+else                          REC="gpt-oss-120b";   TIER="128 GB+"
+fi
+
+cat <<EOF
+
+==> local model for transcription-side jobs (niche, hooks, find) and the
+    local judge. This Mac: ${RAM_GB} GB unified memory -> recommended: ${REC}
+
+    Install LM Studio (https://lmstudio.ai), download the MLX 4-bit build,
+    start its server on port 1234. Load it with 32k context, 1 parallel
+    request - the pipeline does this itself; higher settings ran a 24 GB
+    Mac out of memory (kernel panic).
+
+    What more memory buys you (4-bit MLX; ~8 GB stays free for Whisper,
+    face tracking and ffmpeg). Newer releases of the same families in
+    LM Studio are fine - prefer the latest:
+
+      16 GB      qwen3-8b                    works; weakest picks and hooks
+      24 GB      qwen3-14b                   tested default of this pipeline
+      32-36 GB   qwen3-30b-a3b, gpt-oss-20b  mixture-of-experts: bigger AND faster
+      48 GB      qwen3-32b, gemma-3-27b-it   dense 30B class: clearly better judgement
+      64-96 GB   llama-3.3-70b-instruct      70B class: closest local to Claude
+      128 GB+    gpt-oss-120b, qwen3-235b-a22b (3-bit)
+
+EOF
+
+# ----------------------------------------------------------------- judge --
+CLI=$(command -v claude || true)
+cat <<EOF
+==> who judges the clips? (keep/drop, where to cut - the step that decides
+    what gets posted; everything else always runs locally)
+
+  1) Claude via your Claude Code login    $( [[ -n "$CLI" ]] && echo "[claude CLI found]" || echo "[needs Claude Code installed]" )
+     Best picks: measured far stricter and sharper than a local 14B (kept
+     3/10 street-interview candidates vs 9/10, with specific reasons). No
+     API key; uses your Claude plan allowance (~17 judgments, ~35k tokens
+     per video, ~2 min). Needs internet.
+
+  2) Claude via API key
+     Same quality as 1, billed per token on your Anthropic account instead
+     of plan allowance. Good for unattended/server runs.
+
+  3) Local model only (${REC})
+     Free, offline, private. Weaker selection: a local 14B agreed with a
+     careful manual ranking at only +0.46. Improves once trained on Claude's
+     verdicts (train_judge.py), or with a bigger model if you have the RAM.
+
+  Whichever you pick, every Claude verdict is saved to logs/judge_data.jsonl
+  and becomes training data for your local model - the data carries over
+  to future model releases.
+
+EOF
+if [[ -t 0 ]]; then
+  DEFAULT=$([[ -n "$CLI" ]] && echo 1 || echo 3)
+  read -r -p "Choose 1, 2 or 3 [${DEFAULT}]: " CH
+  CH=${CH:-$DEFAULT}
+else
+  CH=$([[ -n "$CLI" ]] && echo 1 || echo 3)   # non-interactive: best available
+fi
+case "$CH" in
+  1) set_env CLIPPER_JUDGE claude
+     if [[ -z "$CLI" ]]; then
+       echo "   install Claude Code (https://claude.com/claude-code) and log in; the local model is used meanwhile"
+     fi ;;
+  2) set_env CLIPPER_JUDGE claude
+     read -r -s -p "   Anthropic API key (input hidden): " KEY; echo
+     if [[ -n "$KEY" ]]; then
+       set_env ANTHROPIC_API_KEY "$KEY"; echo "   saved to .env (git-ignored, chmod 600)"
+     fi ;;
+  *) set_env CLIPPER_JUDGE local ;;
+esac
+echo "   judge: $(grep '^CLIPPER_JUDGE=' .env | cut -d= -f2)   (change any time: edit .env or re-run setup.sh)"
 
 cat <<'EOF'
 
-==> done.
+==> done. Run:
 
-Next, install a local LLM server (pick one):
-
-  LM Studio   https://lmstudio.ai   - GUI, start the server on port 1234
-  Ollama      brew install ollama && ollama serve
-
-Then pull a model. On 24GB+ unified memory:
-
-  qwen3-30b-a3b        mixture-of-experts, fast, strong at this task
-  gemma-3-27b-it       good alternative
-
-On 16GB, use a 12-14B instruct model instead and lower CAND_COUNT.
-
-Point the pipeline at it:
-
-  export CLIPPER_LLM_URL=http://localhost:1234/v1/chat/completions
-  export CLIPPER_LLM_MODEL=qwen3-30b-a3b
-
-Ollama instead:
-  export CLIPPER_LLM_URL=http://localhost:11434/v1/chat/completions
-
-Then:
   source .venv/bin/activate
-  python3 clipper.py all sources/your-episode.mp4 --niche podcast
+  python3 clipper.py go "https://www.youtube.com/watch?v=..."
 
 EOF
