@@ -373,3 +373,35 @@ still = [[F(0.42, 0.4, 0.06, talk(i))] for i in range(30)]
 assert len(plan_layout(still, 5, [], [(0, 6, "A")], 6.0, 1920, 1080)[0][0]) == 4    # locked
 print("ok follow")
 
+
+# Claude judge: verdict returned, logged as a training example (model, prompt, reply); offline (API faked)
+import json as _json, tempfile as _tf2
+from pathlib import Path as _P
+import clipper as _c
+_c.JUDGE, _c.JUDGE_LOG = "claude", _P(_tf2.mkdtemp()) / "judge.jsonl"
+_c.claude = lambda prompt, system, **k: ('Sure:\n{"keep": true, "standalone": 8, "virality": 7}', {"input_tokens": 9})
+got = _c.judge_json("PROMPT", "SYS", tag="vid#3")
+row = _json.loads(_c.JUDGE_LOG.read_text().splitlines()[0])
+assert got["keep"] is True and got["_by"] == _c.JUDGE_MODEL, got
+assert row["model"] == _c.JUDGE_MODEL and row["prompt"] == "PROMPT" and row["tag"] == "vid#3", row
+_c.JUDGE = "local"
+print("ok claude judge")
+
+# judge training data: Claude rows only, latest per prompt, JSON-only answers, held out by VIDEO
+import train_judge as _tj
+_tj.LOG = _P(_tf2.mkdtemp()) / "j.jsonl"
+with _tj.LOG.open("w") as f:
+    for v in range(14):
+        for k in range(3):
+            f.write(_json.dumps({"tag": f"v{v}#{k}", "model": "claude-x", "system": "S", "prompt": f"p{v}-{k}",
+                                 "reply": 'ok {"keep": true, "virality": 7}'}) + "\n")
+    f.write(_json.dumps({"tag": "v0#0", "model": "local:qwen", "system": "S", "prompt": "q", "reply": "{}"}) + "\n")
+    f.write(_json.dumps({"tag": "v0#0", "model": "claude-x", "system": "S", "prompt": "p0-0",
+                         "reply": '{"keep": false}'}) + "\n")          # re-judged: latest wins
+rows = _tj.teacher_rows()
+assert len(rows) == 42 and next(r for r in rows if r["prompt"] == "p0-0")["answer"] == '{"keep": false}'
+parts = _tj.split(rows)
+vids = {k: {r["tag"].split("#")[0] for r in v} for k, v in parts.items()}
+assert vids["test"] and vids["valid"] and not (vids["test"] & vids["train"]) and not (vids["valid"] & vids["train"]), vids
+assert _tj.chat(rows[0])["messages"][1]["content"].startswith("/no_think ")
+print("ok judge data")

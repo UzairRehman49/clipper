@@ -57,6 +57,10 @@ echo "==> active speaker detection (Light-ASD, MIT, ~4 MB weights) - which face 
 [ -d models/Light-ASD ] || git clone -q --depth 1 https://github.com/Junhua-Liao/Light-ASD.git models/Light-ASD
 .venv-diar/bin/pip install python_speech_features
 
+echo "==> judge training (optional, own venv): LoRA on the local Qwen from Claude's verdicts"
+python3.12 -m venv .venv-train
+.venv-train/bin/pip install mlx-lm
+
 echo "==> youtube publishing (optional)"
 pip install google-api-python-client google-auth-oauthlib
 

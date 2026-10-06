@@ -2302,6 +2302,78 @@ def parse_json_obj(text):
         return None
 
 
+# The editorial judge (select's keep / cut / score pass) can run on Claude
+# while everything else stays local. Every judge call is appended to
+# JUDGE_LOG: Claude's verdicts are the training set for a local LoRA
+# (train_judge.py), and the file is model-agnostic - a new Qwen release is
+# retrained from it, not re-collected.
+# keys can live in a git-ignored .env next to this file (KEY=value lines):
+# batch runs under bash/nohup don't read ~/.zshrc
+for _line in ((ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []):
+    _k, _, _v = _line.partition("=")
+    if _k.strip() and not _line.lstrip().startswith("#"):
+        os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+JUDGE = os.environ.get("CLIPPER_JUDGE", "claude" if os.environ.get("ANTHROPIC_API_KEY") else "local")
+JUDGE_MODEL = os.environ.get("CLIPPER_JUDGE_MODEL", "claude-opus-5-5")
+JUDGE_LOG = ROOT / "logs" / "judge_data.jsonl"
+_judge_lock = threading.Lock()
+
+
+def judge_name():
+    return JUDGE_MODEL if JUDGE == "claude" else "local:" + (current_llm_identifier() or LLM_MODEL)
+
+
+def claude(prompt, system, max_tokens=1500, tries=4):
+    """One Messages API call -> (text, usage). Retries rate limits/overload."""
+    body = json.dumps({"model": JUDGE_MODEL, "max_tokens": max_tokens, "system": system,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    for attempt in range(1, tries + 1):
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+            "x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""), "anthropic-version": "2023-06-01",
+            "content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                d = json.load(r)
+            return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text"), \
+                d.get("usage", {})
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 529) and attempt < tries:
+                time.sleep(5 * attempt)
+                continue
+            raise RuntimeError(f"Claude API {e.code}: {e.read().decode(errors='replace')[:300]}") from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < tries:
+                time.sleep(5 * attempt)
+                continue
+            raise RuntimeError(f"Claude API unreachable: {e}") from e
+
+
+def judge_json(prompt, system, tag=""):
+    """The judge's JSON verdict. Claude if CLIPPER_JUDGE=claude (falls back
+    to the local model if the API fails), else the local model. Logged to
+    JUDGE_LOG either way, with which model answered."""
+    reply, usage, model = None, {}, judge_name()
+    if JUDGE == "claude":
+        try:
+            reply, usage = claude(prompt, system)
+            if not parse_json_obj(reply):
+                reply, usage = claude(prompt + "\n\nReply with ONLY the JSON object.", system)
+        except RuntimeError as e:
+            log(f"    Claude judge failed ({e}) - using the local model")
+            reply = None
+    if not parse_json_obj(reply or ""):
+        model = "local:" + (current_llm_identifier() or LLM_MODEL)
+        reply = llm_retry(prompt, system)
+    got = parse_json_obj(reply or "")
+    if got:
+        JUDGE_LOG.parent.mkdir(exist_ok=True)
+        with _judge_lock, JUDGE_LOG.open("a") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "tag": tag, "model": model,
+                                "system": system, "prompt": prompt, "reply": reply, "usage": usage}) + "\n")
+        got["_by"] = model
+    return got or None
+
+
 def llm_json(prompt, system, want=dict):
     """llm_retry + parse, with one retry that tells the model what was wrong.
     Small local models break the JSON contract often enough that feeding
@@ -2459,7 +2531,7 @@ MIN_OUT_S = 15.0      # a looped (payoff-first) clip shorter than this plays str
 TOPIC_DUP = 0.75      # full-text cosine at/above which two picks are one topic
 
 
-def plan_clip(c, words, niche, context="", names=None, reacts=()):
+def plan_clip(c, words, niche, context="", names=None, reacts=(), tag=""):
     """Second, editorial pass over one candidate with its real text in view.
     find scores a moment from where it *starts*; this pass sees the whole
     span (plus some runway) and decides: keep or not, the real in/out
@@ -2508,7 +2580,7 @@ Return a JSON object only:
   "payoff_end_idx": 0, "standalone": 0, "virality": 0, "reason": ""}}"""
 
     try:
-        obj = llm_json(prompt, system)
+        obj = judge_json(prompt, system, tag)
     except RuntimeError as e:
         log(f"    plan failed: {e}")
         return None
@@ -2545,7 +2617,7 @@ Return a JSON object only:
     return {"keep": obj.get("keep") is not False, "start": s, "end": e, "loop": loop,
             "payoff": payoff, "standalone": standalone, "virality": virality,
             "final": round(0.3 * float(c["score"]) + 0.35 * standalone + 0.35 * virality, 2),
-            "reason": str(obj.get("reason", ""))[:200]}
+            "reason": str(obj.get("reason", ""))[:200], "judge": obj.get("_by", judge_name())}
 
 
 def snap_span(words, s, e, loop):
@@ -2622,11 +2694,13 @@ def cmd_select(args):
     # applause) that ranked just below the cut - two such moments on the
     # Rogan-Vance run never reached judging
     judged += [c for c in by_score[N_JUDGE:] if c.get("signals") or c.get("source") == "heat"][:SIGNAL_SLOTS]
+    log(f"judge: {judge_name()}")
     for c in judged:
-        if "plan" in c:
-            continue
+        if "plan" in c and c["plan"].get("judge", "local").split(":")[0] == judge_name().split(":")[0]:
+            continue                        # judged by this judge already (a new judge re-judges)
         log(f"judging #{c['id']} ({c['end'] - c['start']:.0f}s, find score {c['score']})")
-        c["plan"] = plan_clip(c, words, niche, ctx, names, reacts) or {"keep": False, "final": 0, "reason": "plan failed"}
+        c["plan"] = plan_clip(c, words, niche, ctx, names, reacts, tag=f"{wd.name}#{c['id']}") \
+            or {"keep": False, "final": 0, "reason": "plan failed"}
         p = c["plan"]
         log(f"    {'KEEP' if p['keep'] else 'drop'} final={p['final']} "
             f"loop={'yes' if p.get('loop') else 'no'} - {p['reason']}")

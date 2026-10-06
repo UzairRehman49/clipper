@@ -13,6 +13,8 @@ models/
 .DS_Store
 .claude/
 
-# credentials (publish_youtube.py)
+# credentials (publish_youtube.py, Claude judge)
 token.json
 client_secret.json
+.env
+.venv-train/

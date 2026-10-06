@@ -213,9 +213,20 @@ system that compounds.
 
 ## Known constraints
 
-- **Clip ranking is limited by the 14B model's taste.** Measured: agreement
-  with a careful manual ranking +0.46; a comparative-ranking judge did worse
-  and was removed. A stronger judge model is the open decision.
+- **The judge (which moments to keep, where to cut) runs on Claude** when
+  `ANTHROPIC_API_KEY` is set, either in your environment or in a git-ignored
+  `.env` file next to `clipper.py` as `ANTHROPIC_API_KEY=...`.
+  `CLIPPER_JUDGE_MODEL` picks the model (default `claude-opus-5-5`).
+  Without a key, or if the API fails, it uses the local model. Everything
+  else stays local. The local 14B model agreed with a careful manual
+  ranking at only +0.46.
+- **Every judge call is logged** to `logs/judge_data.jsonl`. Claude's verdicts
+  are the training set for the local model:
+  `.venv-train/bin/python train_judge.py` (LoRA on Qwen3-14B via mlx-lm,
+  about 1.5 h for 200 examples; needs 150+), then `--eval --adapter <dir>`
+  to compare against Claude on held-out videos. A new Qwen release is
+  retrained from the same log with `--model <new MLX dir>`; nothing is
+  re-collected.
 - **Who is talking comes from Light-ASD** (lip crops at 25 fps read together
   with the audio), with faces grouped into people across camera angles
   (SFace), so each voice is matched to a person over the whole clip. A
