@@ -1,61 +1,8 @@
-# Local clipping pipeline — Apple Silicon
+# Clipper — local long-form → short-form pipeline (Apple Silicon)
 
-Long-form video in, captioned vertical clips out. Everything runs on your Mac.
-No subscription, no watermark, no upload limits, no 60-minutes-a-month cap.
-
----
-
-## What the AI actually does
-
-| Stage | Who | Tool |
-|---|---|---|
-| Transcribe with word timestamps | AI | MLX Whisper, Apple GPU |
-| Find candidate moments (phrase-indexed transcript with speaker names and reaction tags) | AI | local LLM + audio-energy spikes + rapid speaker exchanges |
-| Rank by self-containment | AI | local LLM |
-| Judge top 14 (+3 reserved for moments with audience signals), plan in/out points + loop payoff, pick the best non-overlapping, non-duplicate clips | AI (`select`) — or you (`review`) | local LLM + embeddings for topic dedup |
-| Who is speaking (S1/S2 → names from the title) | AI | pyannote community-1 (own venv, needs a free HF token once) |
-| Hooks: verbatim quotes picked from the clip, one per platform; topic-only captions | AI | local LLM picks, code copies the words |
-| Chapters, YouTube replay heatmap, SponsorBlock ad segments | auto | yt-dlp metadata + SponsorBlock API |
-| Laughter / applause / music per second, tagged into the transcript the LLM reads | AI | PANNs (`events.py`, own venv) |
-| Per-shot vertical layout: locked crop on the speaker, facecam-over-game stack, two-person stack, split-screen box zoom, or fit-over-blur for screens | AI | ffmpeg scene cuts + YuNet faces, SFace identity across shots, Light-ASD active speaker, voice-to-person linking |
-| Silence + filler-word jump cuts | auto | Whisper word timestamps |
-| Cold-open loop (payoff first, ends right before it) | auto | ffmpeg |
-| Zoom on jump cuts and vocal emphasis, whoosh/pop SFX | auto | ffmpeg `zoompan`, generated SFX |
-| Word-by-word animated captions | AI | Whisper timestamps → ASS |
-| Loudness normalise to −14 LUFS | auto | ffmpeg |
-| Export 1080×1920 | auto | VideoToolbox hardware encode |
-| Publish to YouTube | auto | Data API |
-| Publish to TikTok | **you** | see below |
-
-`go` runs everything above end to end with no questions. Your hands-on time
-is watching the finished clips before you post them (see below).
-
----
-
-## Why the review step stays human
-
-Not squeamishness — economics. TikTok detects and demotes exact reposts,
-duplicate uploads across accounts, and unedited clips it has seen before,
-escalating to account bans. A ban forfeits campaign views that have not
-finished verification, so it costs you money you already earned.
-
-YouTube is stricter still: its reused-content policy applies *even when you
-have permission from the original creator*, because it is separate from
-copyright. What satisfies it is substantive editing that is unique to your
-channel.
-
-So the pipeline now makes the picks and writes the hooks itself, but you
-still watch every clip before it goes out: that is the check against a wrong
-caption, a weak pick or a framing miss. `review` lets you hand-pick instead.
-A virality score from any tool - including this one - is a plausible number,
-not a measured one; the judge's ranking agreed with a careful manual ranking
-at Spearman +0.46 on the one video it was measured on.
-
-Do **not** try to solve this with sandwich frames or subtle frame insertion.
-TikTok names both explicitly as evasion techniques that draw harsher
-penalties.
-
----
+Link in, captioned vertical clips out (TikTok, Instagram, Shorts). Everything
+runs on your Mac except the optional Claude judge. How it works and why:
+`NOTES.md`. Running it with an agent: `AGENT.md`.
 
 ## Install
 
@@ -63,193 +10,81 @@ penalties.
 chmod +x setup.sh && ./setup.sh
 ```
 
-`setup.sh` installs ffmpeg + ffmpeg-full (libass for captions), deno (yt-dlp
-needs a JS runtime or YouTube throttles it), the main venv, a separate
-`.venv-diar` (pyannote speaker diarization + PANNs audio events - their numpy
-2 would break mediapipe), and the YuNet face model and PANNs weights.
+Installs ffmpeg (+ffmpeg-full for captions), deno, the main venv,
+`.venv-diar` (speaker diarization, audio events, active-speaker detection)
+and `.venv-train` (judge training), plus the face and audio models. It asks
+**who judges the clips** (Claude via your Claude Code login, Claude via API
+key, or local only) and recommends a **local model for your RAM**.
 
-Two one-time steps it can't do for you:
-
-1. **Speaker diarization** needs a free Hugging Face read token with the terms
-   of `pyannote/speaker-diarization-community-1` accepted:
-   `.venv-diar/bin/hf auth login`
-2. **A local LLM server** - LM Studio on port 1234 (or Ollama). Measured on a
-   24 GB Mac: `qwen/qwen3-14b` at 32k context, one request at a time. The
-   pipeline loads the model itself with those settings and reloads it after
-   every call, because LM Studio's MLX backend leaks ~2 GB per request; two
-   parallel requests or a 65k context ran the Mac out of memory (one kernel
-   panic). Point it elsewhere with:
-
-```bash
-export CLIPPER_LLM_URL=http://localhost:1234/v1/chat/completions
-export CLIPPER_LLM_MODEL=qwen/qwen3-14b
-```
-
----
+One-time steps it can't do:
+1. Hugging Face read token with `pyannote/speaker-diarization-community-1`
+   terms accepted: `.venv-diar/bin/hf auth login`
+2. LM Studio serving the recommended model on port 1234. The pipeline loads
+   it itself at 32k context, one request at a time (more ran a 24 GB Mac out
+   of memory).
 
 ## Run
 
 ```bash
 source .venv/bin/activate
-python3 clipper.py go "https://www.youtube.com/watch?v=..."
+python3 clipper.py go "https://www.youtube.com/watch?v=..."   # or a local file
 ```
 
-Link in, finished clips out: downloads audio (full video downloads in the
-background meanwhile), transcribes, detects the niche, finds and judges
-candidates, writes hooks, and renders every pick for TikTok, Instagram and
-Shorts. Each editing effect can be switched off: `--no-cuts --no-loop
---no-zoom --no-sfx`. `go` also takes a local file.
+Stages can run alone: `transcribe`, `find`, `select` (or `review` to pick
+by hand), `render --platform tiktok,instagram`. Output: `out/<id>/<id>_NN_<platform>.mp4`
+plus a `.txt` per clip (hook, caption, why, edit and framing summary).
+Flags: `--max-clips N`, `--niche auto|podcast|streamer|tutorial|finance|comedy|vlog`,
+`--center`, `--no-cuts --no-loop --no-zoom --no-sfx`.
+`python3 test_clipper.py` runs the self-checks in seconds; run it after any change.
 
-Or stage by stage:
+A 3-hour podcast takes ~20 minutes plus the download.
 
-```bash
-python3 clipper.py transcribe sources/ep42.mp4
-python3 clipper.py find       sources/ep42.mp4             # --niche auto by default
-python3 clipper.py select     sources/ep42.mp4             # or `review` to pick by hand
-python3 clipper.py render     sources/ep42.mp4 --platform tiktok,instagram
-```
+## The judge
 
-Output lands in `out/ep42/` as `ep42_01_tiktok.mp4` etc., plus a `.txt`
-sidecar holding the hook, post caption, why it was picked, the edit summary
-(length, cuts, zoom pulses, loop) and a framing summary (layouts used,
-talker found %, speaker on screen %, face-edge frames).
-`python3 test_clipper.py` runs 28 self-checks (edit timeline, speaker labels,
-hooks, signals, framing planner) in a few seconds - run it after any change.
+`select` decides what to keep and where to cut. Settings live in a
+git-ignored `.env`:
 
-### Measured timings (M-series, 24 GB)
+- `CLIPPER_JUDGE=claude` uses the API if `ANTHROPIC_API_KEY` is set, else
+  `claude -p` on your Claude login (bare: no tools, settings or project
+  context). `CLIPPER_JUDGE_MODEL` defaults to `claude-opus-5-5`.
+- `CLIPPER_JUDGE=local` uses the LM Studio model. It's also the fallback if
+  Claude fails.
 
-| Source | Stage | Time |
-|---|---|---|
-| 3 h podcast | transcribe (speaker labels + audio events run alongside) | ~5.5 min |
-| | find | ~7 min |
-| | select (judge 14-17 candidates) | ~2-3 min |
-| | hooks + render 4-6 clips x 3 platforms | ~2-4 min |
-| 75 min panel show | whole `go` run with transcript cached | ~9 min |
-| any | video download at 1080p | network-bound; ~350 MB per hour |
+Every verdict is logged to `logs/judge_data.jsonl`. With 150+ Claude
+verdicts, `.venv-train/bin/python train_judge.py` trains a LoRA on the local
+Qwen (~1.5 h for 200 examples); `--eval --adapter <dir>` compares it with
+Claude on held-out videos. A new Qwen is retrained from the same log
+(`--model <new MLX dir>`).
 
-Unattended. The Mac is kept awake (`caffeinate`) for the run - closing the
-lid on battery still sleeps it.
+## Learning from results
 
-More detail: `PLAN.md` (what was built and why, from a survey of ~20
-open-source clippers) and `TEST_REPORT.md` (every test run, measurement and
-decision).
+Every render adds a row per clip and platform to `logs/clips.csv`. After
+posting, fill in `posted_url`, `views_24h`, `views_7d`; `python3 clipper.py stats`
+shows median views per pipeline choice and how well each score predicts
+views. The per-platform hooks are a free A/B test.
 
----
+## Posting
 
-## Publishing
-
-**YouTube — automated.** Uploads bill to their own quota bucket at 100
-calls/day, so volume is not a constraint.
-
-```bash
-python3 publish_youtube.py out/ep42/ep42_03.mp4 \
-  --title "The first \$10k is the hardest" \
-  --schedule 2026-09-16T14:00:00Z
-```
-
-**TikTok — manual, and this is not a limitation of the script.** Unaudited
-API clients can only post SELF_ONLY (private), capped at 5 users in a 24-hour
-window, with accounts required to be private at the time of posting. Lifting
-that requires a full app audit with a demo video, privacy policy and domain
-verification — an application you would be filing as a software product
-serving creators, which you are not.
-
-Any self-hosted scheduler hits the same wall, because it uses *your*
-developer credentials. Post by hand, or use TikTok Studio's native scheduler
-(10 days ahead, free, unlimited).
-
-**Reframe this as free QC.** The manual TikTok step forces you to look at
-every clip before it goes out, which is exactly the check that stops a bad
-batch from costing you an account.
-
----
+- **YouTube:** `python3 publish_youtube.py out/<id>/<clip>.mp4 --title "..." --schedule <ISO time>`.
+- **TikTok:** by hand or TikTok Studio's scheduler. Unaudited API apps can
+  only post privately.
+- Watch every clip first. TikTok demotes reposts and unedited duplicates.
+  YouTube's reused-content policy applies even with the creator's permission.
+  Never use frame insertion, mirroring or speed/pitch shifts: they're named
+  evasion techniques.
+- Only post clips you have rights to (e.g. a creator's clipping campaign).
 
 ## Tuning
 
-Per-niche selection criteria live in `CRITERIA` at the top of `clipper.py`.
-Rewriting that list for the campaign you are actually working will improve
-your hit rate more than swapping any tool in this stack. Finance rewards
-specific numbers and contrarian claims; streamer content rewards reaction
-beats and escalation.
+Per-niche criteria: `CRITERIA` in `clipper.py`. Environment knobs:
+`CLIPPER_FONT`, `CLIPPER_ASR`, `CLIPPER_FACES=mediapipe`,
+`CLIPPER_LLM_URL` / `CLIPPER_LLM_MODEL`,
+`CLIPPER_COOKIES_BROWSER=chrome` (only if YouTube's bot check blocks
+downloads). Keep `CLIPPER_LLM_PARALLEL=1`.
 
-Other knobs:
+## Known limits
 
-```bash
-export CLIPPER_FONT="Montserrat ExtraBold"   # caption face
-export CLIPPER_ASR=mlx-community/whisper-medium-mlx   # if memory constrained
-export CLIPPER_FACES=mediapipe               # old face detector (default: yunet)
-export CLIPPER_LLM_PARALLEL=1                # >1 ran a 24 GB Mac out of memory
-export CLIPPER_LLM_CYCLE_EVERY=1             # reload the model after N LLM calls
-export CLIPPER_COOKIES_BROWSER=chrome        # only if YouTube's bot check blocks downloads
-```
-
-Flags: `--center` (skip framing analysis, centre crop), `--no-cuts`,
-`--no-loop`, `--no-zoom`, `--no-sfx`, `--max-clips N`, `--niche
-auto|podcast|streamer|tutorial|finance|comedy|vlog`, `--platform
-tiktok,instagram,shorts`.
-
----
-
-## The log is the real asset
-
-Every render writes one row per clip and platform to `logs/clips.csv`. Each
-row records the choices the pipeline made: origin (llm / exchange / heat),
-signals, judge score and final score, loop, main layout, talker coverage,
-which hook variant was used, the hook and the caption. Re-rendering updates the
-row in place and never touches the columns you fill in.
-
-After posting, fill in `posted_url`, `views_24h`, `views_7d` (and optionally
-`likes`). Then run:
-
-    python3 clipper.py stats
-
-It prints median views for each pipeline choice, and the rank correlation
-between each score and real views. The three per-platform hooks are a free
-A/B test. After ~100 clips, this is the data for retuning the judge and the
-signal weights, or for training Laya as a scorer. It is the only part of this
-system that compounds.
-
----
-
-## Known constraints
-
-- **The judge (which moments to keep, where to cut) runs on Claude.** With
-  `ANTHROPIC_API_KEY` set (in your environment, or a git-ignored `.env` as
-  `ANTHROPIC_API_KEY=...`) it uses the API. Without a key it uses the
-  Claude Code CLI (`claude -p`) on your Claude login, run bare: no tools, no
-  settings, no project context. `CLIPPER_JUDGE_MODEL` picks the model
-  (default `claude-opus-5-5`). `CLIPPER_JUDGE=local` forces the local model,
-  which is also the fallback if Claude fails. Measured: ~7 s per judgment,
-  ~1.6k input + 0.4k output tokens each. Claude is far stricter than the
-  local 14B (street interviews: 3/10 kept vs 9/10), which agreed with a
-  careful manual ranking at only +0.46.
-- **Every judge call is logged** to `logs/judge_data.jsonl`. Claude's verdicts
-  are the training set for the local model:
-  `.venv-train/bin/python train_judge.py` (LoRA on Qwen3-14B via mlx-lm,
-  about 1.5 h for 200 examples; needs 150+), then `--eval --adapter <dir>`
-  to compare against Claude on held-out videos. A new Qwen release is
-  retrained from the same log with `--model <new MLX dir>`; nothing is
-  re-collected.
-- **Who is talking comes from Light-ASD** (lip crops at 25 fps read together
-  with the audio), with faces grouped into people across camera angles
-  (SFace), so each voice is matched to a person over the whole clip. A
-  speaker the source never shows still gets a reaction shot, because the
-  source's own edit decides what's on screen. Without `.venv-diar` or the
-  models, it falls back to 5 fps mouth movement. Cost: ~10-40 s per clip.
-- **Moving camera (IRL, handheld)**: the crop pans with the talker only when
-  a locked crop would lose them; studio shots stay locked.
-- **Burned-in tickers and overlays** (sports lower thirds, superchats,
-  stream chat) can be cut by the crop; there's no text detection.
-- **Shots with no detectable face** (screen recordings, B-roll, a back of a
-  head) show the whole frame over a blurred copy rather than a crop.
-- **Hindi-heavy speech transcribes as garbled English** (Whisper forces
-  English). Mostly-English Hindi podcasts are fine. The fix (a Hinglish
-  Whisper model, romanized captions) was planned and dropped.
-- **Hooks are verbatim quotes** chosen by the model - accurate by
-  construction, sometimes flat. Written hooks from the 14B model invented
-  facts about real people and were removed.
-- **Rights:** the pipeline doesn't know whether you're allowed to repost a
-  show. Only post clips you have rights to (e.g. a creator's clipping campaign).
-- **Single-pass loudnorm.** Fine for speech.
-- **Fonts must be installed** for libass to find them. `setup.sh` handles
-  Anton and Montserrat; it falls back to Arial Black otherwise.
+Faceless people get fit-over-blur. Burned-in tickers and overlays can be
+cropped. Small talkers in 1080p wide shots stay small. Hindi-heavy speech
+garbles. Hooks are verbatim quotes: accurate, sometimes flat. Details and
+measurements: `NOTES.md`.

@@ -538,7 +538,7 @@ def _transcribe(args, src, wd, wav, tpath):
     except ImportError:
         sys.exit("mlx-whisper not installed. Run ./setup.sh")
 
-    # Measured on the worst 5-min excerpt (see TEST_REPORT #18): carrying
+    # Measured on the worst 5-min excerpt (NOTES.md, transcribe): carrying
     # the previous text plus a punctuated prompt cut the longest
     # unpunctuated run from 216 to 34 words with full coverage.
     # hallucination_silence_threshold is deliberately absent: it silently
