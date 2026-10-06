@@ -1951,6 +1951,21 @@ def path_expr(path, off):
     return f"if(lt(t,{pts[0][0]:.3f}),{pts[0][1]},{e})"
 
 
+def letterbox(src, start, dur, sw, sh):
+    """(y0, height) of the picture inside black letterbox bars over this
+    span, or None. cropdetect with reset=0 keeps the union of every frame,
+    so one full-frame shot cancels it. Movie footage (2.39:1 inside 16:9)
+    otherwise put black bands inside every vertical crop."""
+    r = subprocess.run(["ffmpeg", "-nostdin", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
+                        "-an", "-vf", "fps=2,cropdetect=limit=24:round=2:reset=0", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    m = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", r.stderr)
+    if not m:
+        return None
+    w, h, _, y = (int(v) for v in m[-1])
+    return (y, h) if w >= 0.95 * sw and h < 0.9 * sh else None
+
+
 def layout_pieces(blocks, segs, start, fps):
     """Split the edit (blocks of kept spans, playback order) at layout
     segment boundaries -> [(seek_abs, [(a, b) rel to seek], seg)]. Split
@@ -2005,7 +2020,8 @@ def piece_filter(i, spans, seg, fps, off=0.0):
              f"[b{i}]crop={w2}:{h2}:{x2}:{y2},scale={W}:{H // 2}:flags=lanczos[bb{i}];"
              f"[tt{i}][bb{i}]vstack,setsar=1[v{i}]")
     else:                                     # F: whole frame over a blurred copy of itself
-        v = (f"{head},split=2[g{i}][f{i}];"
+        pre = f"crop={rects[0][2]}:{rects[0][3]}:{rects[0][0]}:{rects[0][1]}," if rects else ""   # letterbox band
+        v = (f"{head},{pre}split=2[g{i}][f{i}];"
              f"[g{i}]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=24:4[gb{i}];"
              f"[f{i}]scale={W}:-2:flags=lanczos[ff{i}];"
              f"[gb{i}][ff{i}]overlay=(W-w)/2:(H-h)/2,setsar=1[v{i}]")
@@ -2798,17 +2814,22 @@ def cmd_select(args):
 
 # ------------------------------------------------------------- render ------
 
-def cmd_render(args):
+def cmd_render(args, picks=None, outdir=None):
+    """Render the selected candidates - or `picks` supplied by another mode
+    (summarize), each carrying its own hooks and optionally a file `stem`,
+    into `outdir` (default out/<source>/). Returns {stem: {platform: path}}."""
     src = Path(args.source)
     wait_for_prefetch(src)
     wd = workdir(src)
     cpath = wd / "candidates.json"
-    cands = json.loads(cpath.read_text())
     words = json.loads((wd / "transcript.json").read_text())["words"]
-    picks = [c for c in cands if c.get("selected")]
-    if args.pick:
-        ids = {int(x) for x in args.pick.split(",")}
-        picks = [c for c in cands if c["id"] in ids]
+    cands = []
+    if picks is None:
+        cands = json.loads(cpath.read_text())
+        picks = [c for c in cands if c.get("selected")]
+        if args.pick:
+            ids = {int(x) for x in args.pick.split(",")}
+            picks = [c for c in cands if c["id"] in ids]
     if not picks:
         sys.exit("Nothing selected. Run: clipper.py select <source> (or review)")
     platforms = [p.strip() for p in args.platform.split(",")] if args.platform else [""]
@@ -2833,7 +2854,8 @@ def cmd_render(args):
             if gen:
                 c["hooks"], c["caption"], c["hooks_v"] = gen["hooks"], gen["caption"], 10
                 c["hook"] = gen["hooks"][0]
-                cpath.write_text(json.dumps(cands, indent=1))
+                if cands:                        # supplied picks aren't candidates - never overwrite
+                    cpath.write_text(json.dumps(cands, indent=1))
 
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -2850,8 +2872,9 @@ def cmd_render(args):
     sfx = sfx_files() if not args.no_sfx else {}
 
     OUT.mkdir(parents=True, exist_ok=True)
-    outdir = OUT / src.stem
-    outdir.mkdir(exist_ok=True)
+    outdir = outdir or OUT / src.stem
+    outdir.mkdir(parents=True, exist_ok=True)
+    made = {}
 
     for c in picks:
         start = c["start"]
@@ -2877,8 +2900,17 @@ def cmd_render(args):
         frames = [] if args.center else sample_faces(src, start, dur_in)
         cuts = [] if args.center else scene_cuts(src, start, dur_in)
         speaking_scores(src, wd / "audio.wav", start, dur_in, frames, cuts)
+        band = None if args.center else letterbox(src, start, dur_in, sw, sh)
+        if band:                          # plan inside the picture, not the bars
+            y0, bh = band
+            for f in frames:
+                for x in f:
+                    x["cy"], x["h"] = (x["cy"] * sh - y0) / bh, x["h"] * sh / bh
         segs, qa = plan_layout(frames, 5, cuts, speaker_turns(words, start, start + dur_in),
-                               dur_in, sw, sh, center=args.center)
+                               dur_in, sw, band[1] if band else sh, center=args.center)
+        if band:
+            segs = [(g[0], g[1], g[2], [(x, y + band[0], w_, h_) for x, y, w_, h_ in g[3]]
+                     or ([(0, band[0], sw, band[1])] if g[2] == "F" else []), *g[4:]) for g in segs]
         modes = {m: sum(1 for s_ in segs if s_[2] == m) for m in ("R", "S", "F")}
         pans = sum(1 for s_ in segs if len(s_) > 4)
         framing = (f"{len(cuts) + 1} shot(s); crop {modes['R']}" + (f" ({pans} panning)" if pans else "")
@@ -2888,6 +2920,8 @@ def cmd_render(args):
                    + (f"; {qa['cut_faces']} face-edge frames" if qa["cut_faces"] else "")
                    + (f"; voices matched to faces {len(qa['voices'])}/{len({s_ for *_, s_ in speaker_turns(words, start, start + dur_in)})}"
                       if qa.get("voices") is not None else ""))
+        if band:
+            framing += f"; letterbox removed ({band[1]}/{sh} px tall picture)"
         log(f"    framing: {framing}")
 
         pulses = [] if args.no_zoom else emphasis_times(audio, a0, out_words, total)
@@ -2929,7 +2963,7 @@ def cmd_render(args):
         for plat in platforms:
             hooks = c.get("hooks") or [c.get("hook", "")]
             hook_text = hooks[min(PLATFORMS.index(plat) if plat else 0, len(hooks) - 1)]
-            stem = f"{src.stem}_{c['id']:02d}" + (f"_{plat}" if plat else "")
+            stem = c.get("stem", f"{src.stem}_{c['id']:02d}") + (f"_{plat}" if plat else "")
             tmp = Path(tempfile.mkdtemp(prefix="cliprender_"))
             try:
                 assf = tmp / "c.ass"
@@ -2962,6 +2996,9 @@ def cmd_render(args):
                     f"framing: {framing}\n"
                     f"source: {src.name} @ {start:.1f}-{c['end']:.1f}\n")
                 log(f"    -> {dest}")
+                made.setdefault(c.get("stem", c["id"]), {})[plat] = dest
+                if c.get("no_log"):
+                    continue
                 log_clip({"date": time.strftime("%Y-%m-%d"), "source": src.stem, "clip_id": c["id"],
                           "platform": plat or "default", "file": dest.name, "duration": f"{total:.1f}",
                           "origin": c.get("source", ""), "signals": "+".join(c.get("signals") or []),
@@ -2973,6 +3010,7 @@ def cmd_render(args):
                 shutil.rmtree(tmp, ignore_errors=True)
 
     log(f"\n  done: {outdir}")
+    return made
 
 
 # ------------------------------------------------------------ learning -----
@@ -3050,6 +3088,243 @@ def cmd_stats(args):
         print(f"  {col:10s} {r:+.2f}")
     if s["n"] < 30:
         print(f"\n  only {s['n']} clips - treat every number above as a hint, not a finding")
+
+
+# ------------------------------------------------------------ summarize ----
+# Second product: condense a whole video (top-N list, review) into shorts in
+# the host's own words - one summary short running through every item, or
+# one short per item. `go` asks which when the title looks like one.
+
+LIST_TITLE = re.compile(r"\b(top|best|worst|greatest)\s+\d+\b|\b\d+\s+(best|worst|greatest|most|games|movies|"
+                        r"films|shows|series|anime|things|reasons|ways|tips|moments)\b|\branked\b|\branking\b|"
+                        r"\btier list\b", re.I)
+REVIEW_TITLE = re.compile(r"\breview\b|\bworth (it|buying|playing|watching)\b|\bshould you (buy|play|watch)\b"
+                          r"|\bverdict\b", re.I)
+RANK_ONLY = re.compile(r"^\s*(#|no\.?|number|rank)?\s*\d+\s*[:.)\-]?\s*$", re.I)
+SIDE_SECTION = re.compile(r"honou?rable mentions?|bonus|recap|runners?[- ]up", re.I)
+SUMMARY_MAX = 58.0           # seconds for the whole summary short
+WORDS_PER_S = 2.6            # host speech rate, for the per-item word budget
+
+
+def video_kind(meta):
+    """'list' / 'review' from the title, else None."""
+    t = meta.get("title", "")
+    return "list" if LIST_TITLE.search(t) else "review" if REVIEW_TITLE.search(t) else None
+
+
+def ask_purpose(kind, title):
+    """Asked once, at the start of `go`, so the rest runs unattended. Uses
+    /dev/tty (stdin is /dev/null for ffmpeg's sake); with no terminal (batch,
+    agent) it makes clips and says how to ask for a summary instead."""
+    what, part = ("a top-N list", "item") if kind == "list" else ("a review", "section")
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        log(f"  this looks like {what}: making clips. For a summary run with --mode summary "
+            f"(one short) or --mode items (one per {part})")
+        return "clips"
+    with tty:
+        tty.write(f'\n"{title}" looks like {what}. What should the shorts be?\n'
+                  f"  1) clips    the best standalone moments (normal clipping)\n"
+                  f"  2) summary  one short running through the whole video, in the host's words\n"
+                  f"  3) items    one short per {part}\n"
+                  f"Choose 1-3 [2]: ")
+        tty.flush()
+        ans = tty.readline().strip()
+    return {"1": "clips", "3": "items"}.get(ans, "summary")
+
+
+def video_structure(wd, words, meta, kind):
+    """[{label, start, end}] - the list items / review sections in the order
+    presented. Chapters when the video has 3+ (minus intro/outro), else the
+    judge reads the phrase-indexed transcript. Cached in structure.json."""
+    path = wd / "structure.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    dur = words[-1]["e"]
+    ch = [c for c in meta.get("chapters") or [] if not EDGE_CHAPTER.search(c.get("title", ""))]
+    items = []
+    if len(ch) >= 3:
+        items = [{"label": c["title"], "start": float(c["start_time"]),
+                  "end": float(c.get("end_time") or dur)} for c in ch]
+    else:
+        ph = phrases(words)
+        lines = "\n".join(f"[{k}] {' '.join(w['w'] for w in words[a:b + 1])}" for k, (a, b) in enumerate(ph))
+        what = {"list": "a ranked / top-N list", "review": "a review"}.get(kind, "a list or a review")
+        prompt = f"""{video_context(wd)}This video is {what}. Its transcript, one numbered phrase per line:
+{lines}
+
+List the {"items" if kind == "list" else "items or sections"} in the order they are presented. For each:
+- label: the item as named in the video, with its rank if it has one ("#10 Skyrim"),
+  or a short section name for a review ("Story", "Gameplay", "Performance", "Verdict")
+- start_phrase: the number of the phrase where its discussion starts
+Leave out the intro, sponsor reads, channel plugs and the outro.
+
+Return a JSON object only: {{"items": [{{"label": "", "start_phrase": 0}}]}}"""
+        obj = judge_json(prompt, "You map the structure of videos. You return JSON only.",
+                         tag=f"{wd.name}/structure") or {}
+        for it in obj.get("items") or []:
+            try:
+                k = int(it.get("start_phrase"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= k < len(ph) and str(it.get("label", "")).strip():
+                items.append({"label": str(it["label"]).strip()[:60], "start": words[ph[k][0]]["s"]})
+        items.sort(key=lambda x: x["start"])
+        for a, b in zip(items, items[1:]):
+            a["end"] = b["start"]
+        if items:                            # last item: as long as a typical one, not the outro
+            typ = statistics.median([x["end"] - x["start"] for x in items[:-1]] or [60.0])
+            items[-1]["end"] = min(dur, items[-1]["start"] + 1.5 * typ)
+    items = [x for x in items if x["end"] - x["start"] >= 3]
+    # chapters titled only "Number 10": name each item from how it opens
+    bare = [x for x in items if RANK_ONLY.match(x["label"])]
+    if bare:
+        ask = "\n".join(f'{k}. ({x["label"]}) ' + " ".join(w["w"] for w in words if x["start"] <= w["s"] < x["start"] + 25)
+                        for k, x in enumerate(bare))
+        obj = judge_json(f"""{video_context(wd)}Each line is the opening of one item of a ranked list:
+{ask}
+
+Name the thing each item is about (game, film, show...) exactly as said, e.g. "#10 Sinners".
+Return a JSON object only: {{"names": ["#10 ...", "#9 ..."]}} - one per line, same order.""",
+                         "You label video sections. You return JSON only.", tag=f"{wd.name}/labels") or {}
+        for x, n in zip(bare, obj.get("names") or []):
+            if isinstance(n, str) and n.strip() and not RANK_ONLY.match(n):
+                x["label"] = n.strip()[:60]
+    path.write_text(json.dumps(items, indent=1))
+    return items
+
+
+def pick_piece(words, item, budget, ctx, sponsor, tag):
+    """(start, end) of the host's one or two sentences that carry this item -
+    why it's on the list / the verdict - about `budget` seconds."""
+    sw = [w for w in words if item["start"] <= w["s"] < item["end"]
+          and not any(a <= w["s"] < b for a, b, _ in sponsor)]
+    if len(sw) < 5:
+        return None
+    lines = " ".join(f"[{i}]{w['w']}" for i, w in enumerate(sw))
+    prompt = f"""{ctx}The part of the video about: {item['label']}. Numbered words, [index]word:
+{lines}
+
+Pick the one or two consecutive, complete sentences (about {budget:.0f} seconds, ~{int(budget * WORDS_PER_S)}
+words) where the host best says WHY this item is here or what the verdict is - the line a viewer
+needs if they hear nothing else. It must make sense on its own. No filler, no "next up", no plugs.
+
+Return a JSON object only: {{"start_idx": 0, "end_idx": 0}}"""
+    obj = judge_json(prompt, "You are a ruthless short-form video editor. You return JSON only.", tag) or {}
+    try:
+        si, ei = int(obj.get("start_idx")), int(obj.get("end_idx"))
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= si <= ei < len(sw):
+        return None
+    # overlong pick: trim back to a sentence end, else a clause end (comma or
+    # pause) - the first movie summary ran 78.6 s against a 58 s budget
+    brk = lambda i, rx: re.search(rx, sw[i]["w"]) or (i + 1 < len(sw) and sw[i + 1]["s"] - sw[i]["e"] > 0.35)  # noqa: E731
+    for rx in (r"[.?!]$", r"[.?!,;:]$"):
+        if sw[ei]["e"] - sw[si]["s"] <= 1.5 * budget:
+            break
+        k = ei
+        while k > si and (sw[k]["e"] - sw[si]["s"] > 1.5 * budget or not brk(k, rx)):
+            k -= 1
+        if k > si and sw[k]["e"] - sw[si]["s"] >= 2.0:
+            ei = k
+    if sw[ei]["e"] - sw[si]["s"] < 2.0:   # a 0.4 s "piece" says nothing
+        return None
+    return sw[si]["s"], sw[ei]["e"]
+
+
+def concat_shorts(files, dest, fps):
+    """Join rendered pieces (same size/codec settings) into one short."""
+    inputs = [x for f in files for x in ("-i", str(f))]
+    n = len(files)
+    graph = "".join(f"[{i}:v][{i}:a]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", *inputs, "-filter_complex", graph,
+           "-map", "[v]", "-map", "[a]", *VCODEC, "-c:a", "aac", "-b:a", "192k",
+           "-movflags", "+faststart", str(dest)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or missing_frames(dest, fps):
+        i = cmd.index(VCODEC[0])
+        cmd[i:i + len(VCODEC)] = SW_VCODEC
+        run(cmd)
+
+
+def cmd_summarize(args):
+    """Summary short(s) of a list / review video in the host's words:
+    --mode summary = one short through every item; --mode items = one short
+    per item / section."""
+    src = Path(args.source)
+    wd = workdir(src)
+    words = json.loads((wd / "transcript.json").read_text())["words"]
+    meta = load_meta(wd)
+    kind = video_kind(meta)
+    mode = args.mode if args.mode in ("summary", "items") else "summary"
+    items = video_structure(wd, words, meta, kind)
+    if len(items) < 2:
+        log("  couldn't find a list or sections in this video - nothing to summarize "
+            "(use normal clipping: --mode clips)")
+        return
+    log(f"structure ({len(items)}): " + " | ".join(f"{x['label']} @{x['start']:.0f}s" for x in items))
+    ctx, title = video_context(wd), meta.get("title", "") or src.stem
+    sponsor = meta.get("sponsor") or []
+    caption = title
+    vid = src.stem
+
+    if mode == "items":
+        niche = resolve_niche(args.niche, words, wd)
+        names, reacts = speaker_names(words, wd), reactions(wd)
+        picks = []
+        for k, it in enumerate(items, 1):
+            c = {"id": k, "start": it["start"], "end": min(it["end"], it["start"] + CLIP_MAX), "score": 7.0}
+            p = plan_clip(c, words, niche, ctx, names, reacts, tag=f"{vid}#item{k}") or {}
+            s = max(it["start"], p.get("start", it["start"]))
+            e = min(it["end"], p.get("end", c["end"]))
+            if e - s < 8:
+                s, e = it["start"], min(it["end"], it["start"] + CLIP_MAX)
+            loop = p.get("loop") if p.get("loop") and s + 15 <= p["loop"][0] and p["loop"][1] <= e else None
+            picks.append({"id": k, "start": s, "end": e, "loop": loop, "hooks": [it["label"]] * 3, "hooks_v": 10,
+                          "caption": f"{caption} - {it['label']}", "why": p.get("reason", ""),
+                          "stem": f"{vid}_item{k:02d}", "source": "item"})
+            log(f"  item {k} {it['label']}: {s:.1f}-{e:.1f}s")
+        cmd_render(args, picks=picks)
+        return
+
+    items = [x for x in items if not SIDE_SECTION.search(x["label"])] or items   # summary = the list itself
+    budget = max(3.5, min(12.0, SUMMARY_MAX / len(items)))
+    pieces = []
+    for k, it in enumerate(items, 1):
+        span = pick_piece(words, it, budget, ctx, sponsor, tag=f"{vid}~piece{k}")
+        if not span:
+            log(f"  {it['label']}: no usable line - skipped")
+            continue
+        hook = it["label"] if pieces else f"{title} - {it['label']}"
+        pieces.append({"id": k, "start": span[0], "end": span[1], "hooks": [hook] * 3, "hooks_v": 10,
+                       "caption": caption, "stem": f"{vid}_sum{k:02d}", "no_log": True})
+        log(f"  {it['label']}: {span[0]:.1f}-{span[1]:.1f}s ({span[1] - span[0]:.1f}s)")
+    if len(pieces) < 2:
+        log("  not enough usable lines for a summary")
+        return
+    args.no_loop = True                      # a summary plays in order; no cold open per piece
+    made = cmd_render(args, picks=pieces, outdir=wd / "summary_parts")
+    outdir = OUT / vid
+    outdir.mkdir(parents=True, exist_ok=True)
+    for plat in sorted({p for d in made.values() for p in d}):
+        files = [made[p["stem"]][plat] for p in pieces if plat in made.get(p["stem"], {})]
+        dest = outdir / (f"{vid}_summary" + (f"_{plat}" if plat else "") + ".mp4")
+        rate = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                               "stream=r_frame_rate", "-of", "csv=p=0", str(files[0])],
+                              capture_output=True, text=True).stdout.strip() or "30/1"
+        n_, d_ = (float(x) for x in rate.split("/"))
+        concat_shorts(files, dest, n_ / d_ if d_ else 30.0)
+        total = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                      "-of", "csv=p=0", str(dest)], capture_output=True, text=True).stdout or 0)
+        dest.with_suffix(".txt").write_text(
+            f"summary of: {title}\ncaption (post text): {caption}\n"
+            f"pieces: {len(files)} ({', '.join(p['hooks'][0] for p in pieces)})\nlength: {total:.1f}s\n")
+        log(f"  -> {dest} ({total:.1f}s)")
+        log_clip({"date": time.strftime("%Y-%m-%d"), "source": vid, "clip_id": "summary",
+                  "platform": plat or "default", "file": dest.name, "duration": f"{total:.1f}",
+                  "origin": "summary", "hook": pieces[0]["hooks"][0], "caption": caption})
 
 
 # ------------------------------------------------------------------ go -----
@@ -3173,10 +3448,21 @@ def cmd_go(args):
         if video.suffix in AUDIO_EXTS and video.with_suffix(".mp4").exists():
             video = video.with_suffix(".mp4")
 
+    # list / review videos: ask what the shorts are for, before the long run
+    mode = args.mode
+    if mode == "ask":
+        meta = load_meta(workdir(audio))
+        kind = video_kind(meta)
+        mode = ask_purpose(kind, meta.get("title", "")) if kind else "clips"
+
     ns = argparse.Namespace(**vars(args))
     ns.source = str(audio)
     cmd_transcribe(ns)
     free_whisper()
+    if mode in ("summary", "items"):
+        ns.source, ns.mode = str(video), mode
+        cmd_summarize(ns)
+        return
 
     cpath = workdir(audio) / "candidates.json"
     wd = workdir(audio)
@@ -3219,7 +3505,7 @@ def main():
                           "background now, so it overlaps with transcribe/find instead of "
                           "waiting until render")
 
-    for name in ("go", "all", "transcribe", "find", "select", "review", "render"):
+    for name in ("go", "all", "transcribe", "find", "select", "review", "render", "summarize"):
         sp = sub.add_parser(name)
         sp.add_argument("source", help="URL (go) or source file")
         sp.add_argument("--force", action="store_true")
@@ -3235,6 +3521,10 @@ def main():
         sp.add_argument("--no-loop", action="store_true", help="no cold-open loop")
         sp.add_argument("--no-zoom", action="store_true", help="no jump-cut / emphasis zooms")
         sp.add_argument("--no-sfx", action="store_true", help="no whoosh / pop")
+        sp.add_argument("--mode", choices=["ask", "clips", "summary", "items"],
+                        default={"go": "ask", "all": "ask", "summarize": "summary"}.get(name, "clips"),
+                        help="clips = best moments; summary = one short through a list/review video; "
+                             "items = one short per item. go asks when the title looks like a list/review")
     sub.add_parser("stats", help="which pipeline choices earned views (reads logs/clips.csv)")
     a = p.parse_args()
     # Long runs otherwise stall for 15+ min at a time when the Mac idles
@@ -3248,7 +3538,7 @@ def main():
         os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
     {"ingest": cmd_ingest, "go": cmd_go, "all": cmd_go, "transcribe": cmd_transcribe,
      "find": cmd_find, "select": cmd_select, "review": cmd_review,
-     "render": cmd_render, "stats": cmd_stats}[a.cmd](a)
+     "render": cmd_render, "summarize": cmd_summarize, "stats": cmd_stats}[a.cmd](a)
 
 
 if __name__ == "__main__":

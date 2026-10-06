@@ -42,7 +42,8 @@ def teacher_rows():
     for line in LOG.open():
         r = json.loads(line)
         o = obj_of(r["reply"])
-        if r["model"].startswith("claude") and o:
+        # '#' tags are clip judgements (vid#id); structure/summary-piece calls differ in kind
+        if r["model"].startswith("claude") and o and "#" in r.get("tag", ""):
             o.pop("_by", None)
             rows[r["prompt"]] = {**r, "answer": json.dumps(o, ensure_ascii=False)}
     return list(rows.values())

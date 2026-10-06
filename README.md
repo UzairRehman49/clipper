@@ -39,6 +39,18 @@ Flags: `--max-clips N`, `--niche auto|podcast|streamer|tutorial|finance|comedy|v
 
 A 3-hour podcast takes ~20 minutes plus the download.
 
+### Summaries of list and review videos
+
+When the title looks like a top-N list or a review, `go` asks what the
+shorts are for, once, at the start:
+`clips` (best moments), `summary` (one short running through every item in
+the host's own words, with "#5 Name" on screen per item) or `items` (one
+short per item or section). Without a terminal, pass `--mode
+summary|items|clips`. On an already-transcribed video:
+`python3 clipper.py summarize sources/<id>.mp4 --mode items`.
+The structure comes from chapters when the video has them, otherwise from
+the judge reading the transcript (cached in `work/<id>/structure.json`).
+
 ## The judge
 
 `select` decides what to keep and where to cut. Settings live in a

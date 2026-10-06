@@ -405,3 +405,28 @@ vids = {k: {r["tag"].split("#")[0] for r in v} for k, v in parts.items()}
 assert vids["test"] and vids["valid"] and not (vids["test"] & vids["train"]) and not (vids["valid"] & vids["train"]), vids
 assert _tj.chat(rows[0])["messages"][1]["content"].startswith("/no_think ")
 print("ok judge data")
+
+# summarize: list/review titles detected; chapters become the structure (minus intro/outro);
+# a judge pick that runs long is trimmed back to a sentence end near the budget
+from clipper import video_kind, video_structure, pick_piece
+_w = lambda t, a, b: {"w": t, "s": a, "e": b}
+assert video_kind({"title": "Top 10 Open World Games of 2026"}) == "list"
+assert video_kind({"title": "10 Movies That Changed Horror"}) == "list"
+assert video_kind({"title": "Elden Ring Nightreign Review - Worth It?"}) == "review"
+assert video_kind({"title": "Joe Rogan Experience #2281 - Elon Musk"}) is None
+_wd = _P(_tf2.mkdtemp())
+_ws = [_w("x.", i, i + 0.5) for i in range(400)]
+chaps = [{"title": "Intro", "start_time": 0, "end_time": 30}] + \
+        [{"title": f"#{5 - k} Game {k}", "start_time": 30 + 60 * k, "end_time": 90 + 60 * k} for k in range(5)] + \
+        [{"title": "Outro", "start_time": 330, "end_time": 400}]
+st = video_structure(_wd, _ws, {"chapters": chaps}, "list")
+assert [x["label"] for x in st] == [f"#{5 - k} Game {k}" for k in range(5)] and st[0]["start"] == 30, st
+assert video_structure(_wd, [], {}, "list") == st                       # cached
+long = [_w(t, i * 0.4, i * 0.4 + 0.35) for i, t in enumerate(
+    ("It is the best game. " * 2 + "The combat is amazing and deep. " + "blah " * 60).split())]
+_orig = _c.judge_json
+_c.judge_json = lambda *a, **k: {"start_idx": 0, "end_idx": len(long) - 1}
+s_, e_ = pick_piece(long, {"label": "#1", "start": 0, "end": 99}, 4.0, "", [], "t")
+assert s_ == 0 and e_ <= 2 * 4.0 + 2 and long[[x["e"] for x in long].index(e_)]["w"].endswith("."), (s_, e_)
+_c.judge_json = _orig
+print("ok summarize")
