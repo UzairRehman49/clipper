@@ -2,7 +2,7 @@
 
 Link in, captioned vertical clips out (TikTok, Instagram, Shorts). Everything
 runs on your Mac except the optional Claude judge. How it works and why:
-`NOTES.md`. Running it with an agent: `AGENT.md`.
+`NOTES.md`. Running it with an agent: `AGENT.md`. Done / left: `STATUS.md`.
 
 ## Install
 
