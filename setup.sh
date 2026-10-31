@@ -26,6 +26,9 @@ pip install --upgrade pip wheel
 echo "==> MLX Whisper (runs on the Apple GPU, not the CPU)"
 pip install mlx-whisper
 
+echo "==> yt-dlp (downloads YouTube links)"
+pip install yt-dlp
+
 echo "==> face tracking for speaker-aware reframing"
 # mediapipe>=1.0 dropped the mp.solutions API that face_track() uses (its
 # Tasks-API replacement hard-crashes on macOS Metal). Pin to the last
@@ -38,7 +41,7 @@ python3.12 -m venv .venv-diar
 echo "==> audio event model (laughter / applause / music) - PANNs weights, ~330 MB"
 mkdir -p "$HOME/panns_data"
 [ -f "$HOME/panns_data/class_labels_indices.csv" ] || curl -sSL -o "$HOME/panns_data/class_labels_indices.csv" \
-  "http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv"
+  "https://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv"
 [ -f "$HOME/panns_data/Cnn14_DecisionLevelMax.pth" ] || curl -sSL -o "$HOME/panns_data/Cnn14_DecisionLevelMax.pth" \
   "https://zenodo.org/record/3987831/files/Cnn14_DecisionLevelMax_mAP%3D0.385.pth?download=1"
 echo "    one-time: accept the terms at https://huggingface.co/pyannote/speaker-diarization-community-1"
@@ -62,7 +65,8 @@ python3.12 -m venv .venv-train
 .venv-train/bin/pip install mlx-lm
 
 echo "==> youtube publishing (optional)"
-pip install google-api-python-client google-auth-oauthlib
+# protobuf<5: newer protobuf (pulled in by the Google API client) breaks mediapipe 0.10.21
+pip install google-api-python-client google-auth-oauthlib "protobuf<5"
 
 mkdir -p sources work out logs
 touch .env && chmod 600 .env          # settings + keys; git-ignored

@@ -1,7 +1,8 @@
 # Clipper — local long-form → short-form pipeline (Apple Silicon)
 
-Link in, captioned vertical clips out (TikTok, Instagram, Shorts). Everything
-runs on your Mac except the optional Claude judge.
+Turns your own (or a client's) long videos into captioned vertical clips for
+TikTok, Instagram and Shorts: link or file in, clips out. Everything runs on
+your Mac except the optional Claude judge.
 
 ## Install
 
