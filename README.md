@@ -1,8 +1,7 @@
 # Clipper — local long-form → short-form pipeline (Apple Silicon)
 
 Link in, captioned vertical clips out (TikTok, Instagram, Shorts). Everything
-runs on your Mac except the optional Claude judge. How it works and why:
-`NOTES.md`. Running it with an agent: `AGENT.md`. Done / left: `STATUS.md`.
+runs on your Mac except the optional Claude judge.
 
 ## Install
 
@@ -98,5 +97,4 @@ downloads). Keep `CLIPPER_LLM_PARALLEL=1`.
 
 Faceless people get fit-over-blur. Burned-in tickers and overlays can be
 cropped. Small talkers in 1080p wide shots stay small. Hindi-heavy speech
-garbles. Hooks are verbatim quotes: accurate, sometimes flat. Details and
-measurements: `NOTES.md`.
+garbles. Hooks are verbatim quotes: accurate, sometimes flat.

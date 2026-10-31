@@ -4,6 +4,9 @@ work/
 out/
 logs/
 
+# working notes (AGENT, NOTES, STATUS) - their own private repo
+docs/
+
 # environments, caches, local backups
 .venv/
 .venv-diar/
