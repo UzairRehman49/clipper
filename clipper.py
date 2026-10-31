@@ -37,6 +37,13 @@ from pathlib import Path
 # ---------------------------------------------------------------- config ----
 
 ROOT = Path(__file__).resolve().parent
+# settings and keys can live in a git-ignored .env next to this file
+# (KEY=value lines), read before any setting below: batch runs under
+# bash/nohup don't read ~/.zshrc
+for _line in ((ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []):
+    _k, _, _v = _line.partition("=")
+    if _k.strip() and not _line.lstrip().startswith("#"):
+        os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 # Homebrew's plain `ffmpeg` has no libass, so burned-in captions fail with a
 # cryptic filtergraph error - prefer the keg-only ffmpeg-full when present.
 # yt-dlp / hf live in this interpreter's venv bin; make them reachable even
@@ -726,7 +733,16 @@ def current_llm_identifier():
                 return _lms_model_identifier
     except json.JSONDecodeError:
         pass
-    return LLM_MODEL
+    # nothing loaded (LM Studio unloads when idle): LLM_MODEL if it's
+    # downloaded, else the first downloaded chat model - the default isn't
+    # on every machine
+    try:
+        keys = [m["modelKey"] for m in json.loads(lms("ls", "--json").stdout or "[]")
+                if m.get("type") == "llm"]
+    except json.JSONDecodeError:
+        keys = []
+    want = LLM_MODEL.split("/")[-1]
+    return next((k for k in keys if k.split("/")[-1] == want), keys[0] if keys else LLM_MODEL)
 
 
 def wait_for_llm(timeout=180):
@@ -2323,12 +2339,6 @@ def parse_json_obj(text):
 # JUDGE_LOG: Claude's verdicts are the training set for a local LoRA
 # (train_judge.py), and the file is model-agnostic - a new Qwen release is
 # retrained from it, not re-collected.
-# keys can live in a git-ignored .env next to this file (KEY=value lines):
-# batch runs under bash/nohup don't read ~/.zshrc
-for _line in ((ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []):
-    _k, _, _v = _line.partition("=")
-    if _k.strip() and not _line.lstrip().startswith("#"):
-        os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 # Claude without an API key: the Claude Code CLI's print mode runs on the
 # user's Claude login (plan usage, no key). Used when no key is set.
 CLAUDE_CLI = shutil.which("claude")

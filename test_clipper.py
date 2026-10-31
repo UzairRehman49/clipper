@@ -430,3 +430,14 @@ s_, e_ = pick_piece(long, {"label": "#1", "start": 0, "end": 99}, 4.0, "", [], "
 assert s_ == 0 and e_ <= 2 * 4.0 + 2 and long[[x["e"] for x in long].index(e_)]["w"].endswith("."), (s_, e_)
 _c.judge_json = _orig
 print("ok summarize")
+
+# nothing loaded in LM Studio: pick a downloaded chat model, not a default this machine lacks
+from types import SimpleNamespace as _NS
+_orig_lms, _c._lms_model_identifier = _c.lms, None
+_ls = '[{"type": "embedding", "modelKey": "nomic"}, {"type": "llm", "modelKey": "qwen/qwen3-14b"}]'
+_c.lms = lambda *a, **k: _NS(stdout="[]" if a[0] == "ps" else _ls)
+assert _c.current_llm_identifier() == "qwen/qwen3-14b"
+_ls = '[{"type": "llm", "modelKey": "x/a"}, {"type": "llm", "modelKey": "qwen/' + _c.LLM_MODEL.split("/")[-1] + '"}]'
+assert _c.current_llm_identifier().endswith(_c.LLM_MODEL.split("/")[-1])
+_c.lms, _c._lms_model_identifier = _orig_lms, None
+print("ok llm fallback")
